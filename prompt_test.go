@@ -429,6 +429,42 @@ func TestLoadPrefixCreatesMissingFile(t *testing.T) {
 	}
 }
 
+func TestLoadAudioSettingsCreatesDefaultFile(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	path, err := audioSettingsPath()
+	if err != nil {
+		t.Fatalf("audioSettingsPath returned error: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+
+	settings, err := loadAudioSettings()
+	if err != nil {
+		t.Fatalf("loadAudioSettings returned error: %v", err)
+	}
+	if settings.WakeWord != "giraffe" || settings.SplitWord != "dash" || settings.SaveWord != "cucumber" {
+		t.Fatalf("unexpected settings %#v", settings)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected recreated audio settings file, got %v", err)
+	}
+}
+
 func TestWriteCompileJSONSuccess(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeCompileJSON(rec, "hello", nil)

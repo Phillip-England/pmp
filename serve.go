@@ -31,11 +31,12 @@ type navItem struct {
 }
 
 type newPromptPageData struct {
-	Nav   []navItem
-	Error string
-	Title string
-	Body  string
-	Saved bool
+	Nav           []navItem
+	Error         string
+	Title         string
+	Body          string
+	Saved         bool
+	AudioSettings AudioSettings
 }
 
 type prefixPageData struct {
@@ -43,6 +44,13 @@ type prefixPageData struct {
 	Error  string
 	Saved  bool
 	Prefix string
+}
+
+type settingsPageData struct {
+	Nav           []navItem
+	Error         string
+	Saved         bool
+	AudioSettings AudioSettings
 }
 
 type promptListPage struct {
@@ -137,6 +145,7 @@ func runServe() error {
 	mux.HandleFunc("/", serveHome)
 	mux.HandleFunc("/new", serveNewPrompt)
 	mux.HandleFunc("/prefix", servePrefix)
+	mux.HandleFunc("/settings", serveSettings)
 	mux.HandleFunc("/prompts", servePrompts)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
 	mux.HandleFunc("/compile", serveCompile)
@@ -248,8 +257,14 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
+	audioSettings, err := loadAudioSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	data := newPromptPageData{
-		Nav: buildNav("/new"),
+		Nav:           buildNav("/new"),
+		AudioSettings: audioSettings,
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
@@ -279,6 +294,48 @@ func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Redirect(w, r, "/new?saved=1", http.StatusSeeOther)
+		return
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+}
+
+func serveSettings(w http.ResponseWriter, r *http.Request) {
+	audioSettings, err := loadAudioSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := settingsPageData{
+		Nav:           buildNav("/settings"),
+		AudioSettings: audioSettings,
+	}
+	if r.URL.Query().Get("saved") == "1" {
+		data.Saved = true
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		renderTemplate(w, settingsTemplate, data)
+		return
+	case http.MethodPost:
+		if err := r.ParseForm(); err != nil {
+			data.Error = err.Error()
+			renderTemplate(w, settingsTemplate, data)
+			return
+		}
+		data.AudioSettings = normalizeAudioSettings(AudioSettings{
+			WakeWord:  r.Form.Get("wake_word"),
+			SplitWord: r.Form.Get("split_word"),
+			SaveWord:  r.Form.Get("save_word"),
+		})
+		if err := saveAudioSettings(data.AudioSettings); err != nil {
+			data.Error = err.Error()
+			renderTemplate(w, settingsTemplate, data)
+			return
+		}
+		http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 		return
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -382,6 +439,7 @@ func markCompiledPrompt(selected []int) error {
 func buildNav(current string) []navItem {
 	return []navItem{
 		{Label: "New", Href: "/new", Current: current == "/new"},
+		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
 		{Label: "Prefix", Href: "/prefix", Current: current == "/prefix"},
 		{Label: "Prompts", Href: "/prompts", Current: current == "/prompts"},
 		{Label: "Compile", Href: "/compile", Current: current == "/compile"},
@@ -957,6 +1015,12 @@ const baseStyles = `
     border: 1px solid var(--border);
     background: #050505;
     display: inline-block;
+    transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  }
+  .dot.waiting {
+    background: #e0b84d;
+    border-color: #e0b84d;
+    box-shadow: 0 0 0.45rem rgba(224, 184, 77, 0.65);
   }
   .dot.live {
     background: #d93025;
@@ -967,6 +1031,9 @@ const baseStyles = `
     background: var(--action);
     border-color: var(--action);
     box-shadow: 0 0 0.45rem rgba(143, 209, 138, 0.6);
+  }
+  .dot.heard {
+    transform: scale(1.18);
   }
   .mic-status {
     min-height: 1.2rem;
@@ -1071,7 +1138,10 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
           </button>
         </div>
         <div class="compact">
-          <div id="mic-status" class="muted mic-status"></div>
+          <div class="stack">
+            <div id="mic-status" class="muted mic-status"></div>
+            <div id="speech-debug" class="instructions" aria-live="polite"></div>
+          </div>
           <span id="mic-live-dot" class="dot" aria-hidden="true"></span>
         </div>
         <label class="label">
@@ -1086,21 +1156,37 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
           <button type="submit" class="primary">Save prompt</button>
         </div>
         <div class="instructions">
-          Say: title dash body.<br>
-          Say cucumber to save.
+          Say {{.AudioSettings.WakeWord}} to start.<br>
+          Say {{.AudioSettings.SplitWord}} to switch. Say {{.AudioSettings.SaveWord}} to save.
         </div>
       </form>
     </section>
   </main>
   <script>
     var recognition = null;
-    var finalizedTranscript = '';
-    var draftTranscript = '';
-    var autoSaving = false;
+    var recognitionStarting = false;
+    var recognitionActive = false;
+    var shouldKeepListening = false;
+    var micStream = null;
+    var micPermissionDenied = false;
+    var wakeArmed = false;
+    var restartAfterWake = false;
+    var isSubmitting = false;
+    var currentField = 'title';
+    var committedFields = { title: '', body: '' };
+    var draftFields = { title: '', body: '' };
     var micStatus = document.getElementById('mic-status');
+    var speechDebug = document.getElementById('speech-debug');
     var micLiveDot = document.getElementById('mic-live-dot');
     var titleDot = document.getElementById('title-dot');
     var bodyDot = document.getElementById('body-dot');
+    var titleInput = document.getElementById('prompt-title');
+    var bodyInput = document.getElementById('prompt-body');
+    var audioSettings = {
+      wakeWord: {{printf "%q" .AudioSettings.WakeWord}},
+      splitWord: {{printf "%q" .AudioSettings.SplitWord}},
+      saveWord: {{printf "%q" .AudioSettings.SaveWord}}
+    };
     function playStartTone() {
       var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextCtor) {
@@ -1128,50 +1214,245 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       titleDot.classList.toggle('active', field === 'title');
       bodyDot.classList.toggle('active', field === 'body');
     }
-    function setMicLive(live) {
-      micLiveDot.classList.toggle('live', live);
+    function setMicLive(state) {
+      micLiveDot.classList.toggle('waiting', state === 'waiting');
+      micLiveDot.classList.toggle('live', state === 'live');
     }
-    function extractPromptFromSpeech(text) {
-      var sawDash = /\bdash\b/i.test(text);
-      var normalized = text
-        .replace(/\bcucumber\b/ig, ' ')
-        .replace(/\s[-:]\s/g, ' dash ')
+    function pulseHeard(dot) {
+      dot.classList.add('heard');
+      window.setTimeout(function() {
+        dot.classList.remove('heard');
+      }, 180);
+    }
+    function escapeRegExp(text) {
+      return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    function spokenSplitToken() {
+      return ' ' + audioSettings.splitWord + ' ';
+    }
+    function normalizeSpokenText(text) {
+      return text
+        .replace(/\s[-–—:]\s/g, spokenSplitToken())
+        .replace(/[.,!?;()[\]{}"']/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
-      if (!normalized) {
-        return { title: '', body: '', save: /\bcucumber\b/i.test(text), field: sawDash ? 'body' : 'title' };
+    }
+    function commandRegex(command, flags) {
+      var normalized = normalizeSpokenText(command);
+      var escaped = escapeRegExp(normalized).replace(/\\ /g, '\\s+');
+      return new RegExp('(^|\\s)(' + escaped + ')(?=\\s|$)', flags || 'i');
+    }
+    function wakeWordPattern() {
+      return commandRegex(audioSettings.wakeWord, 'i');
+    }
+    function splitAfterWakeWord(text) {
+      var match = wakeWordPattern().exec(text);
+      if (!match) {
+        return null;
       }
-      var parts = normalized.split(/\bdash\b/i);
-      var title = parts[0] ? parts[0].trim() : '';
-      var body = parts.length > 1 ? parts.slice(1).join(' dash ').trim() : '';
       return {
-        title: title,
-        body: body,
-        save: /\bcucumber\b/i.test(text),
-        field: parts.length > 1 ? 'body' : 'title'
+        after: normalizeSpokenText(text.slice(match.index + match[1].length + match[2].length))
       };
     }
-    function updateFieldsFromTranscript() {
-      var joined = (finalizedTranscript + ' ' + draftTranscript).replace(/\s+/g, ' ').trim();
-      if (!joined) {
-        setActiveField('title');
+    function splitAfterWakeWordFromAlternatives(result) {
+      if (!result) {
+        return null;
+      }
+      for (var j = 0; j < result.length; j++) {
+        var transcript = normalizeSpokenText(result[j].transcript);
+        if (!transcript) {
+          continue;
+        }
+        var wakeSplit = splitAfterWakeWord(transcript);
+        if (wakeSplit) {
+          wakeSplit.transcript = transcript;
+          return wakeSplit;
+        }
+      }
+      return null;
+    }
+    function stripLeadingWakeWord(text) {
+      return normalizeSpokenText(text.replace(commandRegex(audioSettings.wakeWord, 'i'), ' '));
+    }
+    function commandPattern() {
+      var commands = [
+        normalizeSpokenText(audioSettings.wakeWord),
+        normalizeSpokenText(audioSettings.splitWord),
+        normalizeSpokenText(audioSettings.saveWord)
+      ].map(function(command) {
+        return escapeRegExp(command).replace(/\\ /g, '\\s+');
+      });
+      return new RegExp('(^|\\s)(' + commands.join('|') + ')(?=\\s|$)', 'ig');
+    }
+    function renderPromptFields(title, body, field) {
+      titleInput.value = title;
+      bodyInput.value = body;
+      setActiveField(field);
+    }
+    function fieldValue(field) {
+      return [committedFields[field], draftFields[field]].join(' ').replace(/\s+/g, ' ').trim();
+    }
+    function renderFromState(field) {
+      renderPromptFields(fieldValue('title'), fieldValue('body'), field);
+    }
+    function updateMicStatus() {
+      if (!recognitionActive) {
+        micStatus.textContent = shouldKeepListening ? 'connecting microphone' : 'paused';
         return;
       }
-      var parsed = extractPromptFromSpeech(joined);
-      document.getElementById('prompt-title').value = parsed.title;
-      document.getElementById('prompt-body').value = parsed.body;
-      setActiveField(parsed.field);
-      if (parsed.save) {
-        submitPromptFromAudio();
+      if (!wakeArmed) {
+        micStatus.textContent = 'listening for ' + audioSettings.wakeWord;
+        return;
+      }
+      micStatus.textContent = currentField === 'body' ? 'capturing body' : 'capturing title';
+    }
+    function setSpeechDebug(message) {
+      speechDebug.textContent = message || '';
+    }
+    function renderWakeListeningState() {
+      setMicLive(recognitionActive ? 'waiting' : '');
+      renderFromState('');
+      updateMicStatus();
+      setSpeechDebug('wake word: ' + audioSettings.wakeWord);
+    }
+    function renderCaptureState() {
+      setMicLive('live');
+      renderFromState(currentField);
+      updateMicStatus();
+      setSpeechDebug('wake word heard');
+    }
+    function resetDraftFields() {
+      draftFields.title = '';
+      draftFields.body = '';
+    }
+    function setCommittedField(field, value) {
+      committedFields[field] = normalizeSpokenText(value || '');
+    }
+    function appendCommitted(field, spoken) {
+      if (!spoken) {
+        return;
+      }
+      committedFields[field] = [committedFields[field], spoken].join(' ').replace(/\s+/g, ' ').trim();
+    }
+    function parseTranscript(text, startingField) {
+      var normalized = normalizeSpokenText(text);
+      var parsed = {
+        title: '',
+        body: '',
+        field: startingField,
+        save: false
+      };
+      if (!normalized) {
+        return parsed;
+      }
+      var field = startingField;
+      var pattern = commandPattern();
+      var lastIndex = 0;
+      var match;
+      while ((match = pattern.exec(normalized)) !== null) {
+        var commandIndex = match.index + match[1].length;
+        var spoken = normalizeSpokenText(normalized.slice(lastIndex, commandIndex));
+        if (spoken) {
+          parsed[field] = [parsed[field], spoken].join(' ').trim();
+        }
+        var command = normalizeSpokenText(match[2]).toLowerCase();
+        lastIndex = commandIndex + match[2].length;
+        if (command === normalizeSpokenText(audioSettings.wakeWord).toLowerCase()) {
+          continue;
+        }
+        if (command === normalizeSpokenText(audioSettings.splitWord).toLowerCase()) {
+          field = 'body';
+          parsed.field = 'body';
+          continue;
+        }
+        if (command === normalizeSpokenText(audioSettings.saveWord).toLowerCase()) {
+          parsed.save = true;
+          break;
+        }
+      }
+      var tail = normalizeSpokenText(normalized.slice(lastIndex));
+      if (tail) {
+        parsed[field] = [parsed[field], tail].join(' ').trim();
+      }
+      parsed.field = field;
+      return parsed;
+    }
+    function applyDraft(parsed) {
+      draftFields.title = parsed.title;
+      draftFields.body = parsed.body;
+      renderFromState(parsed.field);
+    }
+    function commitParsed(parsed) {
+      appendCommitted('title', parsed.title);
+      appendCommitted('body', parsed.body);
+      resetDraftFields();
+      currentField = parsed.field;
+      renderFromState(currentField);
+    }
+    function activateWakeMode() {
+      wakeArmed = true;
+      restartAfterWake = true;
+      currentField = 'title';
+      committedFields.title = '';
+      committedFields.body = '';
+      resetDraftFields();
+      renderCaptureState();
+      pulseHeard(micLiveDot);
+      pulseHeard(titleDot);
+      playStartTone();
+      if (recognition && (recognitionActive || recognitionStarting)) {
+        try {
+          recognition.stop();
+        } catch (err) {
+        }
       }
     }
+    function resetCaptureState() {
+      wakeArmed = false;
+      restartAfterWake = false;
+      currentField = 'title';
+      committedFields.title = '';
+      committedFields.body = '';
+      resetDraftFields();
+      renderWakeListeningState();
+    }
     function submitPromptFromAudio() {
-      if (autoSaving) {
+      if (isSubmitting) {
         return;
       }
-      autoSaving = true;
+      isSubmitting = true;
       pauseMic();
       document.querySelector('form.form-grid').requestSubmit();
+    }
+    function ensureMicStream() {
+      if (micStream) {
+        return Promise.resolve(micStream);
+      }
+      if (micPermissionDenied || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return Promise.resolve(null);
+      }
+      return navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+        micStream = stream;
+        return stream;
+      }).catch(function() {
+        micPermissionDenied = true;
+        recognitionStarting = false;
+        recognitionActive = false;
+        shouldKeepListening = false;
+        micStatus.textContent = 'microphone unavailable';
+        setMicLive('');
+        setActiveField('');
+        return null;
+      });
+    }
+    function releaseMicStream() {
+      if (!micStream) {
+        return;
+      }
+      micStream.getTracks().forEach(function(track) {
+        track.stop();
+      });
+      micStream = null;
     }
     function ensureRecognition() {
       if (recognition) {
@@ -1185,67 +1466,141 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       recognition = new API();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.onresult = function(event) {
-        var finalParts = [];
-        var interimParts = [];
-        for (var i = 0; i < event.results.length; i++) {
-          var transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalParts.push(transcript);
-          } else {
-            interimParts.push(transcript);
-          }
-        }
-        finalizedTranscript = finalParts.join(' ').trim();
-        draftTranscript = interimParts.join(' ').trim();
-        updateFieldsFromTranscript();
-      };
+      recognition.lang = 'en-US';
+      recognition.maxAlternatives = 5;
       recognition.onstart = function() {
-        micStatus.textContent = 'listening';
-        autoSaving = false;
-        setMicLive(true);
-        playStartTone();
+        recognitionStarting = false;
+        recognitionActive = true;
+        isSubmitting = false;
+        if (wakeArmed) {
+          renderCaptureState();
+          return;
+        }
+        renderWakeListeningState();
       };
       recognition.onend = function() {
-        if (micStatus.textContent === 'listening') {
-          micStatus.textContent = 'paused';
+        recognitionStarting = false;
+        recognitionActive = false;
+        if (restartAfterWake && shouldKeepListening && !isSubmitting) {
+          restartAfterWake = false;
+          window.setTimeout(function() {
+            startMic();
+          }, 150);
+          return;
         }
-        setMicLive(false);
+        if (shouldKeepListening && !isSubmitting) {
+          window.setTimeout(function() {
+            startMic();
+          }, 150);
+          return;
+        }
+        releaseMicStream();
+        setMicLive('');
+        if (!wakeArmed) {
+          setActiveField('');
+        }
+        updateMicStatus();
       };
-      recognition.onerror = function() {
+      recognition.onresult = function(event) {
+        for (var i = event.resultIndex; i < event.results.length; i++) {
+          var result = event.results[i];
+          var transcript = normalizeSpokenText(result[0].transcript);
+          if (!transcript) {
+            continue;
+          }
+          pulseHeard(micLiveDot);
+          if (!wakeArmed) {
+            var wakeSplit = splitAfterWakeWordFromAlternatives(result);
+            if (!wakeSplit) {
+              setSpeechDebug('heard: "' + transcript + '"');
+              continue;
+            }
+            activateWakeMode();
+            setSpeechDebug('heard wake word in: "' + wakeSplit.transcript + '"');
+            continue;
+          }
+          var parsed = parseTranscript(stripLeadingWakeWord(transcript), currentField);
+          if (!result.isFinal) {
+            setSpeechDebug('hearing: "' + transcript + '"');
+            applyDraft(parsed);
+            continue;
+          }
+          setSpeechDebug('captured: "' + transcript + '"');
+          commitParsed(parsed);
+          if (currentField === 'body') {
+            pulseHeard(bodyDot);
+          } else {
+            pulseHeard(titleDot);
+          }
+          if (parsed.save) {
+            submitPromptFromAudio();
+            return;
+          }
+        }
+      };
+      recognition.onerror = function(event) {
+        recognitionStarting = false;
+        if (event && (event.error === 'not-allowed' || event.error === 'service-not-allowed' || event.error === 'audio-capture')) {
+          shouldKeepListening = false;
+          recognitionActive = false;
+          micPermissionDenied = true;
+          releaseMicStream();
+          micStatus.textContent = 'microphone unavailable';
+          setMicLive('');
+          setActiveField('');
+          return;
+        }
+        if (event && (event.error === 'aborted' || event.error === 'no-speech')) {
+          return;
+        }
         micStatus.textContent = 'speech error';
-        setMicLive(false);
+        setMicLive('');
       };
       return recognition;
     }
     function startMic() {
       var api = ensureRecognition();
-      if (!api) {
+      if (!api || recognitionActive || recognitionStarting) {
         return;
       }
-      try {
-        api.start();
-      } catch (err) {
-      }
+      shouldKeepListening = true;
+      micStatus.textContent = 'connecting microphone';
+      ensureMicStream().then(function(stream) {
+        if (!shouldKeepListening || !stream || recognitionActive || recognitionStarting) {
+          return;
+        }
+        recognitionStarting = true;
+        try {
+          api.start();
+        } catch (err) {
+          recognitionStarting = false;
+          micStatus.textContent = 'speech input busy';
+        }
+      });
     }
     function pauseMic() {
-      if (!recognition) {
-        return;
+      shouldKeepListening = false;
+      if (recognition && (recognitionActive || recognitionStarting)) {
+        recognition.stop();
+      } else {
+        releaseMicStream();
       }
-      recognition.stop();
+      recognitionStarting = false;
+      recognitionActive = false;
       micStatus.textContent = 'paused';
+      setMicLive('');
+      setActiveField('');
     }
     function clearTranscript() {
-      finalizedTranscript = '';
-      draftTranscript = '';
-      autoSaving = false;
-      document.getElementById('prompt-title').value = '';
-      document.getElementById('prompt-body').value = '';
-      micStatus.textContent = '';
-      setMicLive(false);
-      setActiveField('title');
+      resetCaptureState();
+      isSubmitting = false;
     }
-    setActiveField('title');
+    window.addEventListener('load', function() {
+      renderWakeListeningState();
+      window.setTimeout(function() {
+        startMic();
+      }, 250);
+    });
   </script>
   ` + liveReloadScript + `
 </body>
@@ -1298,8 +1653,13 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
   </main>
   <script>
     var prefixRecognition = null;
+    var prefixRecognitionStarting = false;
+    var prefixRecognitionRunning = false;
+    var prefixMicStream = null;
+    var prefixMicPermissionDenied = false;
     var prefixTranscript = '';
     var prefixDraft = '';
+    var prefixShouldKeepListening = false;
     var prefixMicStatus = document.getElementById('prefix-mic-status');
     var prefixMicLiveDot = document.getElementById('prefix-mic-live-dot');
     function playPrefixStartTone() {
@@ -1327,6 +1687,32 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
     }
     function setPrefixMicLive(live) {
       prefixMicLiveDot.classList.toggle('live', live);
+    }
+    function ensurePrefixMicStream() {
+      if (prefixMicStream) {
+        return Promise.resolve(prefixMicStream);
+      }
+      if (prefixMicPermissionDenied || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return Promise.resolve(null);
+      }
+      return navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+        prefixMicStream = stream;
+        return stream;
+      }).catch(function(err) {
+        prefixMicPermissionDenied = true;
+        prefixMicStatus.textContent = 'microphone unavailable';
+        setPrefixMicLive(false);
+        return null;
+      });
+    }
+    function releasePrefixMicStream() {
+      if (!prefixMicStream) {
+        return;
+      }
+      prefixMicStream.getTracks().forEach(function(track) {
+        track.stop();
+      });
+      prefixMicStream = null;
     }
     function updatePrefixField() {
       document.getElementById('prefix-input').value = (prefixTranscript + ' ' + prefixDraft).replace(/\s+/g, ' ').trim();
@@ -1359,17 +1745,32 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
         updatePrefixField();
       };
       prefixRecognition.onstart = function() {
+        prefixRecognitionStarting = false;
+        prefixRecognitionRunning = true;
         prefixMicStatus.textContent = 'listening';
         setPrefixMicLive(true);
         playPrefixStartTone();
       };
       prefixRecognition.onend = function() {
+        prefixRecognitionStarting = false;
+        prefixRecognitionRunning = false;
         if (prefixMicStatus.textContent === 'listening') {
           prefixMicStatus.textContent = 'paused';
         }
+        if (!prefixShouldKeepListening) {
+          releasePrefixMicStream();
+        }
         setPrefixMicLive(false);
       };
-      prefixRecognition.onerror = function() {
+      prefixRecognition.onerror = function(event) {
+        if (event && (event.error === 'not-allowed' || event.error === 'service-not-allowed')) {
+          prefixShouldKeepListening = false;
+          prefixMicPermissionDenied = true;
+          releasePrefixMicStream();
+          prefixMicStatus.textContent = 'microphone unavailable';
+          setPrefixMicLive(false);
+          return;
+        }
         prefixMicStatus.textContent = 'speech error';
         setPrefixMicLive(false);
       };
@@ -1380,16 +1781,36 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
       if (!api) {
         return;
       }
-      try {
-        api.start();
-      } catch (err) {
+      prefixShouldKeepListening = true;
+      if (prefixRecognitionRunning || prefixRecognitionStarting) {
+        return;
       }
+      prefixMicStatus.textContent = 'connecting microphone';
+      ensurePrefixMicStream().then(function(stream) {
+        if (!prefixShouldKeepListening || !stream || prefixRecognitionRunning || prefixRecognitionStarting) {
+          return;
+        }
+        prefixRecognitionStarting = true;
+        try {
+          api.start();
+        } catch (err) {
+          prefixRecognitionStarting = false;
+          prefixMicStatus.textContent = 'speech input busy';
+        }
+      });
     }
     function pausePrefixMic() {
       if (!prefixRecognition) {
+        prefixShouldKeepListening = false;
+        releasePrefixMicStream();
         return;
       }
-      prefixRecognition.stop();
+      prefixShouldKeepListening = false;
+      if (prefixRecognitionRunning || prefixRecognitionStarting) {
+        prefixRecognition.stop();
+      } else {
+        releasePrefixMicStream();
+      }
       prefixMicStatus.textContent = 'paused';
     }
     function clearPrefixMic() {
@@ -1400,6 +1821,45 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
       setPrefixMicLive(false);
     }
   </script>
+  ` + liveReloadScript + `
+</body>
+</html>`))
+
+var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pmp settings</title>
+  <style>` + baseStyles + `</style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
+    </nav>
+    {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
+    {{if .Saved}}<section class="panel">saved</section>{{end}}
+    <section class="panel">
+      <form method="post" class="form-grid">
+        <label class="label">
+          <span>Wake word</span>
+          <input type="text" name="wake_word" value="{{.AudioSettings.WakeWord}}">
+        </label>
+        <label class="label">
+          <span>Split word</span>
+          <input type="text" name="split_word" value="{{.AudioSettings.SplitWord}}">
+        </label>
+        <label class="label">
+          <span>Save word</span>
+          <input type="text" name="save_word" value="{{.AudioSettings.SaveWord}}">
+        </label>
+        <div class="actions spaced">
+          <button type="submit" class="primary">Save settings</button>
+        </div>
+      </form>
+    </section>
+  </main>
   ` + liveReloadScript + `
 </body>
 </html>`))
