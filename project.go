@@ -12,7 +12,6 @@ const (
 	draftFileName         = "draft.md"
 	marksFileName         = "marks.txt"
 	prefixFileName        = "prefix.md"
-	audioSettingsFileName = "audio-settings.json"
 	projectNoteFileName   = "PROJECT.md"
 )
 
@@ -29,7 +28,7 @@ The tool stores prompts in chronological order so the full history of a project 
 - ` + "`.pmp/prompts/`" + ` contains saved prompt files as markdown with frontmatter.
 - ` + "`.pmp/marks.txt`" + ` stores marked prompt indexes used by the CLI today.
 - ` + "`.pmp/prefix.md`" + ` stores markdown that is prefixed to every compilation.
-- ` + "`.pmp/audio-settings.json`" + ` stores project-level audio keywords for the web UI.
+- system settings such as audio keywords and theme accent are stored in the user config directory for ` + "`pmp`" + `.
 
 ## Prompt format
 
@@ -102,14 +101,6 @@ func runInit() error {
 	} else if err != nil {
 		return err
 	}
-	audioSettings := filepath.Join(base, audioSettingsFileName)
-	if _, err := os.Stat(audioSettings); errors.Is(err, os.ErrNotExist) {
-		if err := writeDefaultAudioSettings(audioSettings); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
 	projectNotePath := filepath.Join(root, projectNoteFileName)
 	if _, err := os.Stat(projectNotePath); errors.Is(err, os.ErrNotExist) {
 		if err := os.WriteFile(projectNotePath, []byte(projectNoteContents), 0o644); err != nil {
@@ -165,12 +156,4 @@ func prefixPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(base, prefixFileName), nil
-}
-
-func audioSettingsPath() (string, error) {
-	base, _, _, err := projectPaths()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, audioSettingsFileName), nil
 }

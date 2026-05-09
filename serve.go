@@ -36,20 +36,23 @@ type newPromptPageData struct {
 	Title         string
 	Body          string
 	Saved         bool
+	AccentColor   string
 	AudioSettings AudioSettings
 }
 
 type prefixPageData struct {
-	Nav    []navItem
-	Error  string
-	Saved  bool
-	Prefix string
+	Nav         []navItem
+	Error       string
+	Saved       bool
+	Prefix      string
+	AccentColor string
 }
 
 type settingsPageData struct {
 	Nav           []navItem
 	Error         string
 	Saved         bool
+	AccentColor   string
 	AudioSettings AudioSettings
 }
 
@@ -61,6 +64,7 @@ type promptListPage struct {
 	PrevPage     int
 	NextPage     int
 	TotalPrompts int
+	AccentColor  string
 }
 
 type PromptView struct {
@@ -80,6 +84,7 @@ type compilePageData struct {
 	MarkedIndex  int
 	HasMark      bool
 	TotalPrompts int
+	AccentColor  string
 }
 
 type CompileOption struct {
@@ -149,6 +154,7 @@ func runServe() error {
 	mux.HandleFunc("/prompts", servePrompts)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
 	mux.HandleFunc("/compile", serveCompile)
+	mux.HandleFunc("/on.wav", serveOnSound)
 	mux.HandleFunc("/ws", hub.handle)
 
 	url := "http://" + listener.Addr().String()
@@ -165,8 +171,17 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/new", http.StatusSeeOther)
 }
 
+func serveOnSound(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "on.wav")
+}
+
 func servePrompts(w http.ResponseWriter, r *http.Request) {
 	prompts, marks, err := loadPromptState()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	themeSettings, err := loadThemeSettings()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -193,6 +208,7 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 	}
 	data.Nav = buildNav("/prompts")
 	data.TotalPrompts = len(prompts)
+	data.AccentColor = themeSettings.AccentColor
 
 	renderTemplate(w, promptsTemplate, data)
 }
@@ -209,6 +225,12 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		Options:      buildCompileOptions(prompts, marks, nil),
 		TotalPrompts: len(prompts),
 	}
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.AccentColor = themeSettings.AccentColor
 	data.MarkedIndex, data.HasMark = currentMarkedIndex(marks)
 	if r.URL.Query().Get("copied") == "1" {
 		data.Copied = true
@@ -257,14 +279,15 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
-	audioSettings, err := loadAudioSettings()
+	systemSettings, err := loadSystemSettings()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	data := newPromptPageData{
 		Nav:           buildNav("/new"),
-		AudioSettings: audioSettings,
+		AccentColor:   systemSettings.Theme.AccentColor,
+		AudioSettings: systemSettings.Audio,
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
@@ -302,14 +325,15 @@ func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveSettings(w http.ResponseWriter, r *http.Request) {
-	audioSettings, err := loadAudioSettings()
+	systemSettings, err := loadSystemSettings()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	data := settingsPageData{
 		Nav:           buildNav("/settings"),
-		AudioSettings: audioSettings,
+		AccentColor:   systemSettings.Theme.AccentColor,
+		AudioSettings: systemSettings.Audio,
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
@@ -325,12 +349,16 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 			renderTemplate(w, settingsTemplate, data)
 			return
 		}
-		data.AudioSettings = normalizeAudioSettings(AudioSettings{
-			WakeWord:  r.Form.Get("wake_word"),
+		systemSettings.Audio = normalizeAudioSettings(AudioSettings{
 			SplitWord: r.Form.Get("split_word"),
 			SaveWord:  r.Form.Get("save_word"),
 		})
-		if err := saveAudioSettings(data.AudioSettings); err != nil {
+		systemSettings.Theme = normalizeThemeSettings(ThemeSettings{
+			AccentColor: r.Form.Get("accent_color"),
+		})
+		data.AudioSettings = systemSettings.Audio
+		data.AccentColor = systemSettings.Theme.AccentColor
+		if err := saveSystemSettings(systemSettings); err != nil {
 			data.Error = err.Error()
 			renderTemplate(w, settingsTemplate, data)
 			return
@@ -344,8 +372,14 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func servePrefix(w http.ResponseWriter, r *http.Request) {
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	data := prefixPageData{
-		Nav: buildNav("/prefix"),
+		Nav:         buildNav("/prefix"),
+		AccentColor: themeSettings.AccentColor,
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
@@ -859,11 +893,22 @@ const baseStyles = `
     border-radius: 0.55rem;
     padding: 0.45rem 0.7rem;
     font: inherit;
+    cursor: pointer;
+    transition: transform 0.12s ease, border-color 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  .nav a:hover, .button:hover, button:hover {
+    border-color: var(--action);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--action) 40%, transparent);
+    transform: translateY(-1px);
   }
   .nav a.current, .button.primary, button.primary {
     background: var(--action);
     color: #000000;
     border-color: var(--action);
+  }
+  .nav a.current:hover, .button.primary:hover, button.primary:hover {
+    background: color-mix(in srgb, var(--action) 88%, white);
+    border-color: color-mix(in srgb, var(--action) 88%, white);
   }
   .panel, details {
     border: 1px solid var(--border);
@@ -974,6 +1019,13 @@ const baseStyles = `
     border: 1px solid var(--border);
     border-radius: 0.7rem;
     background: #050505;
+    cursor: pointer;
+    transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+  }
+  .prompt-option:hover {
+    border-color: var(--action);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--action) 40%, transparent);
+    transform: translateY(-1px);
   }
   .prompt-option input {
     margin-top: 0.15rem;
@@ -982,7 +1034,7 @@ const baseStyles = `
     color: #ffffff;
     border-color: #ffffff;
   }
-  textarea, input[type="text"] {
+  textarea, input[type="text"], select {
     width: 100%;
     border: 1px solid var(--border);
     background: #050505;
@@ -1043,6 +1095,10 @@ const baseStyles = `
     font-size: 0.88rem;
     line-height: 1.35;
   }
+  .section-title {
+    margin: 0 0 0.2rem;
+    font-size: 0.95rem;
+  }
   .prompt-actions {
     display: flex;
     justify-content: flex-end;
@@ -1087,6 +1143,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp</title>
   <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
@@ -1113,6 +1170,7 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp new</title>
   <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
@@ -1156,7 +1214,7 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
           <button type="submit" class="primary">Save prompt</button>
         </div>
         <div class="instructions">
-          Say {{.AudioSettings.WakeWord}} to start.<br>
+          Click the mic to start title dictation.<br>
           Say {{.AudioSettings.SplitWord}} to switch. Say {{.AudioSettings.SaveWord}} to save.
         </div>
       </form>
@@ -1169,12 +1227,10 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
     var shouldKeepListening = false;
     var micStream = null;
     var micPermissionDenied = false;
-    var wakeArmed = false;
-    var restartAfterWake = false;
     var isSubmitting = false;
     var currentField = 'title';
-    var committedFields = { title: '', body: '' };
-    var draftFields = { title: '', body: '' };
+    var finalTranscript = '';
+    var draftTranscript = '';
     var micStatus = document.getElementById('mic-status');
     var speechDebug = document.getElementById('speech-debug');
     var micLiveDot = document.getElementById('mic-live-dot');
@@ -1183,11 +1239,17 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
     var titleInput = document.getElementById('prompt-title');
     var bodyInput = document.getElementById('prompt-body');
     var audioSettings = {
-      wakeWord: {{printf "%q" .AudioSettings.WakeWord}},
       splitWord: {{printf "%q" .AudioSettings.SplitWord}},
       saveWord: {{printf "%q" .AudioSettings.SaveWord}}
     };
-    function playStartTone() {
+    function playMicOnSound() {
+      try {
+        var audio = new Audio('/on.wav');
+        audio.play();
+      } catch (err) {
+      }
+    }
+    function playTransitionClickSound() {
       var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextCtor) {
         return;
@@ -1196,14 +1258,14 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
         var ctx = new AudioContextCtor();
         var osc = ctx.createOscillator();
         var gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = 880;
-        gain.gain.value = 0.03;
+        osc.type = 'square';
+        osc.frequency.value = 1320;
+        gain.gain.value = 0.025;
         osc.connect(gain);
         gain.connect(ctx.destination);
         osc.start();
-        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
-        osc.stop(ctx.currentTime + 0.12);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.05);
+        osc.stop(ctx.currentTime + 0.05);
         osc.onended = function() {
           ctx.close();
         };
@@ -1237,46 +1299,8 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
         .replace(/\s+/g, ' ')
         .trim();
     }
-    function commandRegex(command, flags) {
-      var normalized = normalizeSpokenText(command);
-      var escaped = escapeRegExp(normalized).replace(/\\ /g, '\\s+');
-      return new RegExp('(^|\\s)(' + escaped + ')(?=\\s|$)', flags || 'i');
-    }
-    function wakeWordPattern() {
-      return commandRegex(audioSettings.wakeWord, 'i');
-    }
-    function splitAfterWakeWord(text) {
-      var match = wakeWordPattern().exec(text);
-      if (!match) {
-        return null;
-      }
-      return {
-        after: normalizeSpokenText(text.slice(match.index + match[1].length + match[2].length))
-      };
-    }
-    function splitAfterWakeWordFromAlternatives(result) {
-      if (!result) {
-        return null;
-      }
-      for (var j = 0; j < result.length; j++) {
-        var transcript = normalizeSpokenText(result[j].transcript);
-        if (!transcript) {
-          continue;
-        }
-        var wakeSplit = splitAfterWakeWord(transcript);
-        if (wakeSplit) {
-          wakeSplit.transcript = transcript;
-          return wakeSplit;
-        }
-      }
-      return null;
-    }
-    function stripLeadingWakeWord(text) {
-      return normalizeSpokenText(text.replace(commandRegex(audioSettings.wakeWord, 'i'), ' '));
-    }
     function commandPattern() {
       var commands = [
-        normalizeSpokenText(audioSettings.wakeWord),
         normalizeSpokenText(audioSettings.splitWord),
         normalizeSpokenText(audioSettings.saveWord)
       ].map(function(command) {
@@ -1289,19 +1313,9 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       bodyInput.value = body;
       setActiveField(field);
     }
-    function fieldValue(field) {
-      return [committedFields[field], draftFields[field]].join(' ').replace(/\s+/g, ' ').trim();
-    }
-    function renderFromState(field) {
-      renderPromptFields(fieldValue('title'), fieldValue('body'), field);
-    }
     function updateMicStatus() {
       if (!recognitionActive) {
         micStatus.textContent = shouldKeepListening ? 'connecting microphone' : 'paused';
-        return;
-      }
-      if (!wakeArmed) {
-        micStatus.textContent = 'listening for ' + audioSettings.wakeWord;
         return;
       }
       micStatus.textContent = currentField === 'body' ? 'capturing body' : 'capturing title';
@@ -1309,30 +1323,17 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
     function setSpeechDebug(message) {
       speechDebug.textContent = message || '';
     }
-    function renderWakeListeningState() {
+    function renderIdleState() {
       setMicLive(recognitionActive ? 'waiting' : '');
-      renderFromState('');
+      renderPromptFields(titleInput.value, bodyInput.value, '');
       updateMicStatus();
-      setSpeechDebug('wake word: ' + audioSettings.wakeWord);
+      setSpeechDebug('click mic to start');
     }
     function renderCaptureState() {
       setMicLive('live');
-      renderFromState(currentField);
+      renderPromptFields(titleInput.value, bodyInput.value, currentField);
       updateMicStatus();
-      setSpeechDebug('wake word heard');
-    }
-    function resetDraftFields() {
-      draftFields.title = '';
-      draftFields.body = '';
-    }
-    function setCommittedField(field, value) {
-      committedFields[field] = normalizeSpokenText(value || '');
-    }
-    function appendCommitted(field, spoken) {
-      if (!spoken) {
-        return;
-      }
-      committedFields[field] = [committedFields[field], spoken].join(' ').replace(/\s+/g, ' ').trim();
+      setSpeechDebug(currentField === 'body' ? 'capturing body' : 'capturing title');
     }
     function parseTranscript(text, startingField) {
       var normalized = normalizeSpokenText(text);
@@ -1357,9 +1358,6 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
         }
         var command = normalizeSpokenText(match[2]).toLowerCase();
         lastIndex = commandIndex + match[2].length;
-        if (command === normalizeSpokenText(audioSettings.wakeWord).toLowerCase()) {
-          continue;
-        }
         if (command === normalizeSpokenText(audioSettings.splitWord).toLowerCase()) {
           field = 'body';
           parsed.field = 'body';
@@ -1377,44 +1375,23 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       parsed.field = field;
       return parsed;
     }
-    function applyDraft(parsed) {
-      draftFields.title = parsed.title;
-      draftFields.body = parsed.body;
-      renderFromState(parsed.field);
-    }
-    function commitParsed(parsed) {
-      appendCommitted('title', parsed.title);
-      appendCommitted('body', parsed.body);
-      resetDraftFields();
+    function updateFieldsFromTranscript() {
+      var previousField = currentField;
+      var parsed = parseTranscript((finalTranscript + ' ' + draftTranscript).replace(/\s+/g, ' ').trim(), 'title');
       currentField = parsed.field;
-      renderFromState(currentField);
-    }
-    function activateWakeMode() {
-      wakeArmed = true;
-      restartAfterWake = true;
-      currentField = 'title';
-      committedFields.title = '';
-      committedFields.body = '';
-      resetDraftFields();
-      renderCaptureState();
-      pulseHeard(micLiveDot);
-      pulseHeard(titleDot);
-      playStartTone();
-      if (recognition && (recognitionActive || recognitionStarting)) {
-        try {
-          recognition.stop();
-        } catch (err) {
-        }
+      if (previousField === 'title' && currentField === 'body') {
+        playTransitionClickSound();
       }
+      renderPromptFields(parsed.title, parsed.body, currentField);
+      return parsed;
     }
     function resetCaptureState() {
-      wakeArmed = false;
-      restartAfterWake = false;
       currentField = 'title';
-      committedFields.title = '';
-      committedFields.body = '';
-      resetDraftFields();
-      renderWakeListeningState();
+      finalTranscript = '';
+      draftTranscript = '';
+      titleInput.value = '';
+      bodyInput.value = '';
+      renderIdleState();
     }
     function submitPromptFromAudio() {
       if (isSubmitting) {
@@ -1472,70 +1449,58 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
         recognitionStarting = false;
         recognitionActive = true;
         isSubmitting = false;
-        if (wakeArmed) {
-          renderCaptureState();
-          return;
-        }
-        renderWakeListeningState();
+        updateFieldsFromTranscript();
+        renderCaptureState();
+        playMicOnSound();
       };
       recognition.onend = function() {
         recognitionStarting = false;
         recognitionActive = false;
-        if (restartAfterWake && shouldKeepListening && !isSubmitting) {
-          restartAfterWake = false;
-          window.setTimeout(function() {
-            startMic();
-          }, 150);
-          return;
-        }
         if (shouldKeepListening && !isSubmitting) {
           window.setTimeout(function() {
-            startMic();
+            startMic(true);
           }, 150);
           return;
         }
         releaseMicStream();
         setMicLive('');
-        if (!wakeArmed) {
-          setActiveField('');
-        }
+        setActiveField('');
         updateMicStatus();
       };
       recognition.onresult = function(event) {
-        for (var i = event.resultIndex; i < event.results.length; i++) {
-          var result = event.results[i];
-          var transcript = normalizeSpokenText(result[0].transcript);
+        var finalParts = [];
+        var interimParts = [];
+        for (var i = 0; i < event.results.length; i++) {
+          var transcript = normalizeSpokenText(event.results[i][0].transcript);
           if (!transcript) {
             continue;
           }
-          pulseHeard(micLiveDot);
-          if (!wakeArmed) {
-            var wakeSplit = splitAfterWakeWordFromAlternatives(result);
-            if (!wakeSplit) {
-              setSpeechDebug('heard: "' + transcript + '"');
-              continue;
-            }
-            activateWakeMode();
-            setSpeechDebug('heard wake word in: "' + wakeSplit.transcript + '"');
-            continue;
-          }
-          var parsed = parseTranscript(stripLeadingWakeWord(transcript), currentField);
-          if (!result.isFinal) {
-            setSpeechDebug('hearing: "' + transcript + '"');
-            applyDraft(parsed);
-            continue;
-          }
-          setSpeechDebug('captured: "' + transcript + '"');
-          commitParsed(parsed);
-          if (currentField === 'body') {
-            pulseHeard(bodyDot);
+          if (event.results[i].isFinal) {
+            finalParts.push(transcript);
           } else {
-            pulseHeard(titleDot);
+            interimParts.push(transcript);
           }
-          if (parsed.save) {
-            submitPromptFromAudio();
-            return;
-          }
+        }
+        if (!finalParts.length && !interimParts.length) {
+          return;
+        }
+        pulseHeard(micLiveDot);
+        finalTranscript = finalParts.join(' ').trim();
+        draftTranscript = interimParts.join(' ').trim();
+        var parsed = updateFieldsFromTranscript();
+        if (draftTranscript) {
+          setSpeechDebug('hearing: "' + draftTranscript + '"');
+        } else {
+          setSpeechDebug('captured: "' + finalTranscript + '"');
+        }
+        if (currentField === 'body') {
+          pulseHeard(bodyDot);
+        } else {
+          pulseHeard(titleDot);
+        }
+        if (parsed.save && !draftTranscript) {
+          submitPromptFromAudio();
+          return;
         }
       };
       recognition.onerror = function(event) {
@@ -1558,12 +1523,20 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       };
       return recognition;
     }
-    function startMic() {
+    function startMic(preserveText) {
       var api = ensureRecognition();
       if (!api || recognitionActive || recognitionStarting) {
         return;
       }
       shouldKeepListening = true;
+      if (!preserveText) {
+        currentField = 'title';
+        finalTranscript = '';
+        draftTranscript = '';
+        titleInput.value = '';
+        bodyInput.value = '';
+      }
+      renderCaptureState();
       micStatus.textContent = 'connecting microphone';
       ensureMicStream().then(function(stream) {
         if (!shouldKeepListening || !stream || recognitionActive || recognitionStarting) {
@@ -1595,12 +1568,7 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       resetCaptureState();
       isSubmitting = false;
     }
-    window.addEventListener('load', function() {
-      renderWakeListeningState();
-      window.setTimeout(function() {
-        startMic();
-      }, 250);
-    });
+    renderIdleState();
   </script>
   ` + liveReloadScript + `
 </body>
@@ -1613,6 +1581,7 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp prefix</title>
   <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
@@ -1662,26 +1631,10 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
     var prefixShouldKeepListening = false;
     var prefixMicStatus = document.getElementById('prefix-mic-status');
     var prefixMicLiveDot = document.getElementById('prefix-mic-live-dot');
-    function playPrefixStartTone() {
-      var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextCtor) {
-        return;
-      }
+    function playMicOnSound() {
       try {
-        var ctx = new AudioContextCtor();
-        var osc = ctx.createOscillator();
-        var gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = 880;
-        gain.gain.value = 0.03;
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
-        osc.stop(ctx.currentTime + 0.12);
-        osc.onended = function() {
-          ctx.close();
-        };
+        var audio = new Audio('/on.wav');
+        audio.play();
       } catch (err) {
       }
     }
@@ -1749,7 +1702,7 @@ var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
         prefixRecognitionRunning = true;
         prefixMicStatus.textContent = 'listening';
         setPrefixMicLive(true);
-        playPrefixStartTone();
+        playMicOnSound();
       };
       prefixRecognition.onend = function() {
         prefixRecognitionStarting = false;
@@ -1832,6 +1785,7 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp settings</title>
   <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
@@ -1842,10 +1796,10 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
     {{if .Saved}}<section class="panel">saved</section>{{end}}
     <section class="panel">
       <form method="post" class="form-grid">
-        <label class="label">
-          <span>Wake word</span>
-          <input type="text" name="wake_word" value="{{.AudioSettings.WakeWord}}">
-        </label>
+        <div class="stack">
+          <h2 class="section-title">Audio Keywords</h2>
+          <div class="instructions">These apply across every project on this machine.</div>
+        </div>
         <label class="label">
           <span>Split word</span>
           <input type="text" name="split_word" value="{{.AudioSettings.SplitWord}}">
@@ -1854,12 +1808,31 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
           <span>Save word</span>
           <input type="text" name="save_word" value="{{.AudioSettings.SaveWord}}">
         </label>
+        <div class="stack">
+          <h2 class="section-title">Theme</h2>
+          <div class="instructions">Accent color is also system-wide.</div>
+        </div>
+        <label class="label">
+          <span>Accent color</span>
+          <input type="color" name="accent_color" value="{{.AccentColor}}">
+        </label>
         <div class="actions spaced">
           <button type="submit" class="primary">Save settings</button>
         </div>
       </form>
     </section>
   </main>
+  <script>
+    (function() {
+      var input = document.querySelector('input[name="accent_color"]');
+      if (!input) {
+        return;
+      }
+      input.addEventListener('input', function(event) {
+        document.documentElement.style.setProperty('--action', event.currentTarget.value);
+      });
+    })();
+  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))
@@ -1871,6 +1844,7 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp prompts</title>
   <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
@@ -1930,20 +1904,22 @@ var compileTemplate = template.Must(template.New("compile").Parse(`<!doctype htm
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp compile</title>
   <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
     <nav class="nav">
       {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
     </nav>
-    <section class="panel compact">
-      <div>{{.TotalPrompts}} prompts</div>
-      <div class="actions">
-        <button type="button" onclick="setAll(true)">Select all</button>
-        {{if .HasMark}}<button type="button" onclick="selectFromMark()">Select from mark</button>{{end}}
-        <button type="button" onclick="setAll(false)">Clear all</button>
-      </div>
-    </section>
+	    <section class="panel compact">
+	      <div>{{.TotalPrompts}} prompts</div>
+	      <div class="actions">
+	        <button type="button" onclick="setAll(true)">Select all</button>
+	        {{if .HasMark}}<button type="button" onclick="selectFromMark()">Select from mark</button>{{end}}
+	        {{if .HasMark}}<button type="button" onclick="compileFromMark()">Compile from mark</button>{{end}}
+	        <button type="button" onclick="setAll(false)">Clear all</button>
+	      </div>
+	    </section>
     {{if .Error}}
     <section class="panel error">{{.Error}}</section>
     {{end}}
@@ -1970,87 +1946,111 @@ var compileTemplate = template.Must(template.New("compile").Parse(`<!doctype htm
         </div>
       </form>
     </section>
-  </main>
-  <script>
-    function setAll(checked) {
-      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
-        el.checked = checked;
-      });
-    }
-    function selectFromMark() {
-      var picker = document.querySelector('.prompt-picker');
-      if (!picker) {
-        return;
-      }
-      var markedIndex = parseInt(picker.getAttribute('data-marked-index'), 10);
-      if (Number.isNaN(markedIndex)) {
-        return;
-      }
-      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
-        var index = parseInt(el.getAttribute('data-index'), 10);
-        el.checked = !Number.isNaN(index) && index > markedIndex;
-      });
-    }
-    document.getElementById('compile-form').addEventListener('submit', function(event) {
-      event.preventDefault();
-      var form = event.currentTarget;
-      var params = new URLSearchParams();
-      form.querySelectorAll('input[name="prompt"]:checked').forEach(function(el) {
-        params.append('prompt', el.value);
-      });
-      if (!params.has('prompt')) {
-        var emptyError = document.querySelector('.error');
-        if (!emptyError) {
-          emptyError = document.createElement('section');
-          emptyError.className = 'panel error';
-          form.parentNode.parentNode.insertBefore(emptyError, form.parentNode);
-        }
-        emptyError.textContent = 'select at least one prompt to compile';
-        return;
-      }
-      fetch('/compile', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
-        },
-        body: params.toString()
-      }).then(function(response) {
-        return response.json();
-      }).then(function(payload) {
-        if (payload.error) {
-          var error = document.querySelector('.error');
-          if (!error) {
-            error = document.createElement('section');
-            error.className = 'panel error';
-            form.parentNode.parentNode.insertBefore(error, form.parentNode);
-          }
-          error.textContent = payload.error;
-          return;
-        }
-        var text = payload.compiled || '';
-        function fallbackCopy() {
-          var area = document.createElement('textarea');
-          area.value = text;
-          document.body.appendChild(area);
-          area.focus();
-          area.select();
-          try {
-            document.execCommand('copy');
-          } catch (err) {
-          }
-          document.body.removeChild(area);
-        }
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).catch(fallbackCopy).finally(function() {
-            window.location.href = '/compile?copied=1';
-          });
-        } else {
-          fallbackCopy();
-          window.location.href = '/compile?copied=1';
-        }
-      });
-    });
-  </script>
+	  </main>
+	  <script>
+	    function pickerElement() {
+	      return document.querySelector('.prompt-picker');
+	    }
+	    function markedIndex() {
+	      var picker = pickerElement();
+	      if (!picker) {
+	        return NaN;
+	      }
+	      return parseInt(picker.getAttribute('data-marked-index'), 10);
+	    }
+	    function createParamsFromSelection(predicate) {
+	      var params = new URLSearchParams();
+	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
+	        if (predicate(el)) {
+	          params.append('prompt', el.value);
+	        }
+	      });
+	      return params;
+	    }
+	    function showCompileError(message) {
+	      var form = document.getElementById('compile-form');
+	      var error = document.querySelector('.error');
+	      if (!error) {
+	        error = document.createElement('section');
+	        error.className = 'panel error';
+	        form.parentNode.parentNode.insertBefore(error, form.parentNode);
+	      }
+	      error.textContent = message;
+	    }
+	    function submitCompile(params, emptyMessage) {
+	      var form = document.getElementById('compile-form');
+	      if (!params.has('prompt')) {
+	        showCompileError(emptyMessage);
+	        return;
+	      }
+	      fetch('/compile', {
+	        method: 'POST',
+	        headers: {
+	          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+	        },
+	        body: params.toString()
+	      }).then(function(response) {
+	        return response.json();
+	      }).then(function(payload) {
+	        if (payload.error) {
+	          showCompileError(payload.error);
+	          return;
+	        }
+	        var text = payload.compiled || '';
+	        function fallbackCopy() {
+	          var area = document.createElement('textarea');
+	          area.value = text;
+	          document.body.appendChild(area);
+	          area.focus();
+	          area.select();
+	          try {
+	            document.execCommand('copy');
+	          } catch (err) {
+	          }
+	          document.body.removeChild(area);
+	        }
+	        if (navigator.clipboard && navigator.clipboard.writeText) {
+	          navigator.clipboard.writeText(text).catch(fallbackCopy).finally(function() {
+	            window.location.href = '/compile?copied=1';
+	          });
+	        } else {
+	          fallbackCopy();
+	          window.location.href = '/compile?copied=1';
+	        }
+	      });
+	    }
+	    function setAll(checked) {
+	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
+	        el.checked = checked;
+	      });
+	    }
+	    function selectFromMark() {
+	      var mark = markedIndex();
+	      if (Number.isNaN(mark)) {
+	        return;
+	      }
+	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
+	        var index = parseInt(el.getAttribute('data-index'), 10);
+	        el.checked = !Number.isNaN(index) && index > mark;
+	      });
+	    }
+	    function compileFromMark() {
+	      var mark = markedIndex();
+	      if (Number.isNaN(mark)) {
+	        return;
+	      }
+	      submitCompile(createParamsFromSelection(function(el) {
+	        var index = parseInt(el.getAttribute('data-index'), 10);
+	        return !Number.isNaN(index) && index > mark;
+	      }), 'no prompts found after the marked prompt');
+	    }
+	    document.getElementById('compile-form').addEventListener('submit', function(event) {
+	      event.preventDefault();
+	      submitCompile(createParamsFromSelection(function(el) {
+	        return el.checked;
+	      }), 'select at least one prompt to compile');
+	    });
+	  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))

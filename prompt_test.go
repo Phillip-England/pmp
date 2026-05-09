@@ -441,13 +441,23 @@ func TestLoadAudioSettingsCreatesDefaultFile(t *testing.T) {
 	defer func() {
 		_ = os.Chdir(wd)
 	}()
+	configDir := filepath.Join(tempDir, "config")
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
 
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
 	}
-	path, err := audioSettingsPath()
+	if _, err := loadAudioSettings(); err != nil {
+		t.Fatalf("loadAudioSettings returned error: %v", err)
+	}
+	path, err := systemSettingsPath()
 	if err != nil {
-		t.Fatalf("audioSettingsPath returned error: %v", err)
+		t.Fatalf("systemSettingsPath returned error: %v", err)
 	}
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("Remove returned error: %v", err)
@@ -457,11 +467,33 @@ func TestLoadAudioSettingsCreatesDefaultFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadAudioSettings returned error: %v", err)
 	}
-	if settings.WakeWord != "giraffe" || settings.SplitWord != "dash" || settings.SaveWord != "cucumber" {
+	if settings.SplitWord != "dash" || settings.SaveWord != "cucumber" {
 		t.Fatalf("unexpected settings %#v", settings)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected recreated audio settings file, got %v", err)
+	}
+}
+
+func TestSaveThemeSettingsUpdatesSystemSettings(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+
+	if err := saveThemeSettings(ThemeSettings{AccentColor: "#79c2d0"}); err != nil {
+		t.Fatalf("saveThemeSettings returned error: %v", err)
+	}
+
+	theme, err := loadThemeSettings()
+	if err != nil {
+		t.Fatalf("loadThemeSettings returned error: %v", err)
+	}
+	if theme.AccentColor != "#79c2d0" {
+		t.Fatalf("unexpected theme %#v", theme)
 	}
 }
 

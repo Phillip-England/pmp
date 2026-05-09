@@ -1,0 +1,5 @@
+{
+  "wake_word": "start",
+  "split_word": "dash",
+  "save_word": "cucumber"
+}
