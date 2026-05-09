@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -265,4 +266,52 @@ func projectName(root string) string {
 		return root
 	}
 	return name
+}
+
+func createProjectAtScanRoot(name string, root string, allowedRoots []string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("project name is required")
+	}
+	if name == "." || name == ".." {
+		return errors.New("project name is invalid")
+	}
+	if strings.Contains(name, string(filepath.Separator)) {
+		return errors.New("project name must not include path separators")
+	}
+
+	root, err := filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return err
+	}
+	root = filepath.Clean(root)
+	if !projectRootAllowed(root, allowedRoots) {
+		return errors.New("project root must be one of the configured scan roots")
+	}
+
+	target := filepath.Join(root, name)
+	if _, err := os.Stat(target); err == nil {
+		return errors.New("project already exists at that path")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return err
+	}
+	if err := initProjectAtRoot(target); err != nil {
+		return err
+	}
+	return setProjectRootOverride(target)
+}
+
+func projectRootAllowed(root string, allowedRoots []string) bool {
+	root = filepath.Clean(strings.TrimSpace(root))
+	for _, allowed := range allowedRoots {
+		allowed = filepath.Clean(strings.TrimSpace(allowed))
+		if allowed != "" && root == allowed {
+			return true
+		}
+	}
+	return false
 }

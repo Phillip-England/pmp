@@ -63,30 +63,44 @@ func loadPrompts() ([]Prompt, error) {
 	if err := ensureProject(); err != nil {
 		return nil, err
 	}
-
 	_, promptsDir, _, err := projectPaths()
 	if err != nil {
 		return nil, err
 	}
+	return loadMarkdownRecords(promptsDir)
+}
 
-	entries, err := os.ReadDir(promptsDir)
+func loadResponses() ([]Prompt, error) {
+	if err := ensureProject(); err != nil {
+		return nil, err
+	}
+	responsesDir, err := responsesPath()
 	if err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(responsesDir, 0o755); err != nil {
+		return nil, err
+	}
+	return loadMarkdownRecords(responsesDir)
+}
 
+func loadMarkdownRecords(dir string) ([]Prompt, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
 	prompts := make([]Prompt, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
 			continue
 		}
-		path := filepath.Join(promptsDir, entry.Name())
+		path := filepath.Join(dir, entry.Name())
 		prompt, err := readPromptFile(path)
 		if err != nil {
 			return nil, err
 		}
 		prompts = append(prompts, prompt)
 	}
-
 	sortPrompts(prompts)
 	return prompts, nil
 }

@@ -105,11 +105,21 @@ func TestCompilePromptsAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compilePrompts returned error: %v", err)
 	}
-	if !strings.Contains(compiled, "<!-- prompt 0 | 2026-05-08T12:00:00Z -->") {
-		t.Fatalf("expected first prompt metadata, got %q", compiled)
+	if !strings.Contains(compiled, "<!-- SKILLS SECTION -->") || !strings.Contains(compiled, "<!-- PROMPTS SECTION -->") {
+		t.Fatalf("expected compile sections, got %q", compiled)
 	}
-	if !strings.Contains(compiled, "# Second\n\nBeta") {
-		t.Fatalf("expected second prompt body, got %q", compiled)
+	if !strings.Contains(compiled, "<!-- prompt 0 | 2026-05-08T12:00:00Z -->") || !strings.Contains(compiled, "# Second\n\nBeta") {
+		t.Fatalf("expected prompt content in output, got %q", compiled)
+	}
+}
+
+func TestPrefixCompiledWithInstructions(t *testing.T) {
+	compiled := prefixCompiledWithInstructions("# Project\n\nFollow this", "<!-- prompt 0 -->\n# Prompt")
+	if !strings.Contains(compiled, "<!-- INSTRUCTIONS SECTION -->") || !strings.Contains(compiled, "# Instructions Section") {
+		t.Fatalf("expected instructions section, got %q", compiled)
+	}
+	if !strings.Contains(compiled, "# Project\n\nFollow this") {
+		t.Fatalf("expected instructions prefix, got %q", compiled)
 	}
 }
 
@@ -192,8 +202,11 @@ func TestCompilePromptIndexesIncludesSkills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compilePromptIndexes returned error: %v", err)
 	}
-	if !strings.HasPrefix(compiled, "# UI Skill\n\nIntro\n\n<!-- prompt 0") {
+	if !strings.Contains(compiled, "<!-- SKILLS SECTION -->") || !strings.Contains(compiled, "# UI Skill\n\nIntro") {
 		t.Fatalf("expected skills at top, got %q", compiled)
+	}
+	if !strings.Contains(compiled, "<!-- PROMPTS SECTION -->") || !strings.Contains(compiled, "<!-- prompt 0") {
+		t.Fatalf("expected prompts section, got %q", compiled)
 	}
 }
 
@@ -337,7 +350,7 @@ func TestIndexesForwardFromMarkAtEnd(t *testing.T) {
 	}
 }
 
-func TestRunInitCreatesProjectNote(t *testing.T) {
+func TestRunInitCreatesInstructionsFile(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd returned error: %v", err)
@@ -354,13 +367,131 @@ func TestRunInitCreatesProjectNote(t *testing.T) {
 		t.Fatalf("runInit returned error: %v", err)
 	}
 
-	notePath := filepath.Join(tempDir, projectNoteFileName)
+	notePath := filepath.Join(tempDir, instructionsFileName)
 	note, err := os.ReadFile(notePath)
 	if err != nil {
 		t.Fatalf("ReadFile returned error: %v", err)
 	}
-	if !strings.Contains(string(note), "Prompt Memory Project") && !strings.Contains(string(note), "pmp") {
-		t.Fatalf("expected project note contents, got %q", string(note))
+	if !strings.Contains(string(note), ".pmp/responses/") || !strings.Contains(string(note), "Required Response Note") {
+		t.Fatalf("expected instructions contents, got %q", string(note))
+	}
+}
+
+func TestSaveAndLoadProjectInstructions(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if err := saveProjectInstructions("# Instructions\n\nBe precise."); err != nil {
+		t.Fatalf("saveProjectInstructions returned error: %v", err)
+	}
+	body, err := loadProjectInstructions()
+	if err != nil {
+		t.Fatalf("loadProjectInstructions returned error: %v", err)
+	}
+	if !strings.Contains(body, "Be precise.") {
+		t.Fatalf("unexpected instructions body %q", body)
+	}
+}
+
+func TestRunInitCreatesResponsesDirectory(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, projectDirName, responsesDirName)); err != nil {
+		t.Fatalf("expected responses directory, got %v", err)
+	}
+}
+
+func TestCreateProjectAtScanRootInitializesAndActivatesProject(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	scanRoot, err := os.MkdirTemp(wd, "create-project-root-")
+	if err != nil {
+		t.Fatalf("MkdirTemp returned error: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(scanRoot)
+	}()
+	if err := createProjectAtScanRoot("alpha", scanRoot, []string{scanRoot}); err != nil {
+		t.Fatalf("createProjectAtScanRoot returned error: %v", err)
+	}
+
+	target := filepath.Join(scanRoot, "alpha")
+	if _, err := os.Stat(filepath.Join(target, projectDirName, promptsDirName)); err != nil {
+		t.Fatalf("expected initialized prompts dir, got %v", err)
+	}
+	root, err := projectRoot()
+	if err != nil {
+		t.Fatalf("projectRoot returned error: %v", err)
+	}
+	if filepath.Clean(root) != filepath.Clean(target) {
+		t.Fatalf("expected active project root %q, got %q", target, root)
+	}
+	projects, err := loadRegisteredProjects()
+	if err != nil {
+		t.Fatalf("loadRegisteredProjects returned error: %v", err)
+	}
+	if len(projects) != 1 || filepath.Clean(projects[0].Path) != filepath.Clean(target) {
+		t.Fatalf("expected created project to be registered, got %#v", projects)
+	}
+}
+
+func TestCreateProjectAtScanRootRejectsExistingPath(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	scanRoot, err := os.MkdirTemp(wd, "existing-project-root-")
+	if err != nil {
+		t.Fatalf("MkdirTemp returned error: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(scanRoot)
+	}()
+
+	target := filepath.Join(scanRoot, "alpha")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+
+	err = createProjectAtScanRoot("alpha", scanRoot, []string{scanRoot})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected existing project error, got %v", err)
 	}
 }
 
@@ -393,6 +524,56 @@ func TestMarkCompiledPromptReplacesExistingMarks(t *testing.T) {
 	}
 	if len(marks) != 1 || !marks[4] {
 		t.Fatalf("expected only latest compiled prompt to remain marked, got %#v", marks)
+	}
+}
+
+func TestServeDeletePromptRemovesPrompt(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	first := Prompt{Title: "Zero", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Zero\n\nA\n"}
+	second := Prompt{Title: "One", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# One\n\nB\n"}
+	if _, err := savePrompt(first); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+	if _, err := savePrompt(second); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/prompts/delete", strings.NewReader("delete_prompt=1"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveDeletePrompt(rec, req)
+
+	if rec.Code != 303 {
+		t.Fatalf("expected redirect status, got %d", rec.Code)
+	}
+	if location := rec.Header().Get("Location"); location != "/prompts" {
+		t.Fatalf("unexpected redirect location %q", location)
+	}
+	prompts, err := loadPrompts()
+	if err != nil {
+		t.Fatalf("loadPrompts returned error: %v", err)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("expected 1 prompt after delete, got %d", len(prompts))
+	}
+	if prompts[0].Title != "Zero" {
+		t.Fatalf("expected oldest prompt to remain, got %#v", prompts)
 	}
 }
 
@@ -565,6 +746,89 @@ func TestWriteCompileJSONSuccess(t *testing.T) {
 	}
 	if payload["compiled"] != "hello" {
 		t.Fatalf("unexpected payload %#v", payload)
+	}
+}
+
+func TestServeCompilePrefixesProjectInstructions(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if err := saveProjectInstructions("# Instructions\n\nAlways respect project context."); err != nil {
+		t.Fatalf("saveProjectInstructions returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "Zero",
+		Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+		Markdown:  "# Zero\n\nA\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/compile", strings.NewReader("prompt=0"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveCompile(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if !strings.Contains(payload["compiled"], "<!-- INSTRUCTIONS SECTION -->") || !strings.Contains(payload["compiled"], "<!-- PROMPTS SECTION -->") {
+		t.Fatalf("expected compile sections, got %q", payload["compiled"])
+	}
+	if !strings.Contains(payload["compiled"], "Always respect project context.") {
+		t.Fatalf("expected instructions prefix, got %q", payload["compiled"])
+	}
+}
+
+func TestLoadResponsesReadsResponseNotes(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	responseDir := filepath.Join(tempDir, projectDirName, responsesDirName)
+	response := Prompt{
+		Title:     "Model Response",
+		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
+		Markdown:  "# Model Response\n\nImportant result.\n",
+	}
+	if err := os.WriteFile(filepath.Join(responseDir, "20260508T120500Z-model-response.md"), []byte(formatPromptFile(response)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	responses, err := loadResponses()
+	if err != nil {
+		t.Fatalf("loadResponses returned error: %v", err)
+	}
+	if len(responses) != 1 || responses[0].Title != "Model Response" {
+		t.Fatalf("unexpected responses %#v", responses)
 	}
 }
 
@@ -803,5 +1067,69 @@ func TestDiscoverProjectsScansConfiguredRootsOnly(t *testing.T) {
 	}
 	if foundTwo {
 		t.Fatalf("did not expect project outside configured roots, got %#v", projects)
+	}
+}
+
+func TestServeProjectCreateCreatesProjectUnderConfiguredRoot(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	currentProject := t.TempDir()
+	if err := setProjectRootOverride(currentProject); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	scanRoot, err := os.MkdirTemp(wd, "serve-project-create-root-")
+	if err != nil {
+		t.Fatalf("MkdirTemp returned error: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(scanRoot)
+	}()
+	settings := defaultSystemSettings()
+	settings.Projects = normalizeProjectSettings(ProjectSettings{
+		ScanRoots: []string{scanRoot},
+	})
+	if err := saveSystemSettings(settings); err != nil {
+		t.Fatalf("saveSystemSettings returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/projects/create", strings.NewReader(url.Values{
+		"project_name": {"bravo"},
+		"project_root": {scanRoot},
+	}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveProjectCreate(rec, req)
+
+	if rec.Code != 303 {
+		t.Fatalf("expected redirect status, got %d", rec.Code)
+	}
+	if location := rec.Header().Get("Location"); location != "/projects?created=1" {
+		t.Fatalf("unexpected redirect location %q", location)
+	}
+	target := filepath.Join(scanRoot, "bravo")
+	if _, err := os.Stat(filepath.Join(target, projectDirName, promptsDirName)); err != nil {
+		t.Fatalf("expected initialized project at target, got %v", err)
+	}
+	root, err := projectRoot()
+	if err != nil {
+		t.Fatalf("projectRoot returned error: %v", err)
+	}
+	if filepath.Clean(root) != filepath.Clean(target) {
+		t.Fatalf("expected active project root %q, got %q", target, root)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,15 @@ type settingsPageData struct {
 	ProjectScanRoots string
 }
 
+type instructionsPageData struct {
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Error          string
+	Saved          bool
+	AccentColor    string
+	Body           string
+}
+
 type promptListPage struct {
 	Nav            []navItem
 	CurrentProject currentProjectData
@@ -86,6 +96,14 @@ type promptListPage struct {
 	AccentColor    string
 	MarkedIndex    int
 	HasMark        bool
+}
+
+type responseListPage struct {
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Responses      []PromptView
+	TotalResponses int
+	AccentColor    string
 }
 
 type PromptView struct {
@@ -114,8 +132,13 @@ type projectsPageData struct {
 	Nav            []navItem
 	CurrentProject currentProjectData
 	Projects       []projectListItem
+	ScanRoots      []string
 	AccentColor    string
 	Switched       bool
+	Created        bool
+	Error          string
+	NewProjectName string
+	NewProjectRoot string
 }
 
 func newWebsocketHub() *websocketHub {
@@ -165,12 +188,15 @@ func runServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveHome)
 	mux.HandleFunc("/new", serveNewPrompt)
+	mux.HandleFunc("/instructions", serveInstructions)
 	mux.HandleFunc("/skills", serveSkills)
 	mux.HandleFunc("/settings", serveSettings)
 	mux.HandleFunc("/prompts", servePrompts)
+	mux.HandleFunc("/responses", serveResponses)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
 	mux.HandleFunc("/projects", serveProjects)
 	mux.HandleFunc("/projects/switch", serveProjectSwitch)
+	mux.HandleFunc("/projects/create", serveProjectCreate)
 	mux.HandleFunc("/compile", serveCompile)
 	mux.HandleFunc("/ws", hub.handle)
 
@@ -202,6 +228,11 @@ func serveProjects(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	systemSettings, err := loadSystemSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	currentProject, err := loadCurrentProjectData()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -216,8 +247,10 @@ func serveProjects(w http.ResponseWriter, r *http.Request) {
 		Nav:            buildNav("/projects"),
 		CurrentProject: currentProject,
 		Projects:       buildProjectListItems(projects, currentProject.Path),
+		ScanRoots:      systemSettings.Projects.ScanRoots,
 		AccentColor:    themeSettings.AccentColor,
 		Switched:       r.URL.Query().Get("switched") == "1",
+		Created:        r.URL.Query().Get("created") == "1",
 	}
 	renderTemplate(w, projectsTemplate, data)
 }
@@ -250,6 +283,59 @@ func serveProjectSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/projects?switched=1", http.StatusSeeOther)
+}
+
+func serveProjectCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := registerCurrentProject(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	systemSettings, err := loadSystemSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	currentProject, err := loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	name := strings.TrimSpace(r.Form.Get("project_name"))
+	root := strings.TrimSpace(r.Form.Get("project_root"))
+	if err := createProjectAtScanRoot(name, root, systemSettings.Projects.ScanRoots); err != nil {
+		projects, discoverErr := discoverProjects()
+		if discoverErr != nil {
+			http.Error(w, discoverErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		data := projectsPageData{
+			Nav:            buildNav("/projects"),
+			CurrentProject: currentProject,
+			Projects:       buildProjectListItems(projects, currentProject.Path),
+			ScanRoots:      systemSettings.Projects.ScanRoots,
+			AccentColor:    themeSettings.AccentColor,
+			Error:          err.Error(),
+			NewProjectName: name,
+			NewProjectRoot: root,
+		}
+		renderTemplate(w, projectsTemplate, data)
+		return
+	}
+	http.Redirect(w, r, "/projects?created=1", http.StatusSeeOther)
 }
 
 func servePrompts(w http.ResponseWriter, r *http.Request) {
@@ -289,6 +375,32 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 	renderTemplate(w, promptsTemplate, data)
 }
 
+func serveResponses(w http.ResponseWriter, r *http.Request) {
+	responses, err := loadResponses()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	views := buildPromptViews(responses, nil)
+	data := responseListPage{
+		Nav:            buildNav("/responses"),
+		Responses:      views,
+		TotalResponses: len(responses),
+		AccentColor:    themeSettings.AccentColor,
+	}
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderTemplate(w, responsesTemplate, data)
+}
+
 func serveCompile(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		http.Redirect(w, r, "/prompts", http.StatusSeeOther)
@@ -303,6 +415,11 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	projectInstructions, err := loadProjectInstructions()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	skills, err := loadSkills()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -312,7 +429,7 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		writeCompileJSON(w, "", err)
 		return
 	}
-	selected, err := parseSelectedPromptIndexes(r.Form["prompt"], len(prompts))
+	selected, err := resolveCompileIndexes(r.Form, len(prompts))
 	if err != nil {
 		writeCompileJSON(w, "", err)
 		return
@@ -323,9 +440,12 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		writeCompileJSON(w, "", err)
 		return
 	}
-	if err := markCompiledPrompt(selected); err != nil {
-		writeCompileJSON(w, "", err)
-		return
+	compiled = prefixCompiledWithInstructions(projectInstructions, compiled)
+	if shouldUpdateMark(r.Form) && len(selected) > 0 {
+		if err := markCompiledPrompt(selected); err != nil {
+			writeCompileJSON(w, "", err)
+			return
+		}
 	}
 	writeCompileJSON(w, compiled, nil)
 }
@@ -431,6 +551,55 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func serveInstructions(w http.ResponseWriter, r *http.Request) {
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, err := loadProjectInstructions()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := instructionsPageData{
+		Nav:         buildNav("/instructions"),
+		AccentColor: themeSettings.AccentColor,
+		Body:        body,
+	}
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if r.URL.Query().Get("saved") == "1" {
+		data.Saved = true
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		renderTemplate(w, instructionsTemplate, data)
+		return
+	case http.MethodPost:
+		if err := r.ParseForm(); err != nil {
+			data.Error = err.Error()
+			renderTemplate(w, instructionsTemplate, data)
+			return
+		}
+		data.Body = r.Form.Get("body")
+		if err := saveProjectInstructions(data.Body); err != nil {
+			data.Error = err.Error()
+			renderTemplate(w, instructionsTemplate, data)
+			return
+		}
+		http.Redirect(w, r, "/instructions?saved=1", http.StatusSeeOther)
+		return
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+}
+
 func serveSkills(w http.ResponseWriter, r *http.Request) {
 	themeSettings, err := loadThemeSettings()
 	if err != nil {
@@ -506,7 +675,11 @@ func serveDeletePrompt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	index, err := strconv.Atoi(r.Form.Get("index"))
+	indexValue := strings.TrimSpace(r.Form.Get("index"))
+	if indexValue == "" {
+		indexValue = strings.TrimSpace(r.Form.Get("delete_prompt"))
+	}
+	index, err := strconv.Atoi(indexValue)
 	if err != nil {
 		http.Error(w, "invalid prompt index", http.StatusBadRequest)
 		return
@@ -555,9 +728,11 @@ func buildNav(current string) []navItem {
 	return []navItem{
 		{Label: "New", Href: "/new", Current: current == "/new"},
 		{Label: "Projects", Href: "/projects", Current: current == "/projects"},
+		{Label: "Instructions", Href: "/instructions", Current: current == "/instructions"},
 		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
 		{Label: "Skills", Href: "/skills", Current: current == "/skills"},
 		{Label: "Prompts", Href: "/prompts", Current: current == "/prompts"},
+		{Label: "Responses", Href: "/responses", Current: current == "/responses"},
 	}
 }
 
@@ -624,9 +799,20 @@ func writeCompileJSON(w http.ResponseWriter, compiled string, err error) {
 }
 
 func buildPage(prompts []Prompt, marks map[int]bool) (promptListPage, error) {
+	data := promptListPage{
+		Prompts: buildPromptViews(prompts, marks),
+	}
+	return data, nil
+}
+
+func buildPromptViews(prompts []Prompt, marks map[int]bool) []PromptView {
 	views := make([]PromptView, 0, len(prompts))
 	for index := len(prompts) - 1; index >= 0; index-- {
 		prompt := prompts[index]
+		marked := false
+		if marks != nil {
+			marked = marks[index]
+		}
 		views = append(views, PromptView{
 			Index:      index,
 			Title:      prompt.Title,
@@ -635,15 +821,11 @@ func buildPage(prompts []Prompt, marks map[int]bool) (promptListPage, error) {
 			SearchText: strings.ToLower(prompt.Title + "\n" + prompt.Markdown),
 			HTMLBody:   template.HTML(renderMarkdown(prompt.Markdown)),
 			ElementID:  fmt.Sprintf("prompt-%d", index),
-			Marked:     marks[index],
+			Marked:     marked,
 			Checked:    false,
 		})
 	}
-
-	data := promptListPage{
-		Prompts: views,
-	}
-	return data, nil
+	return views
 }
 
 func buildSkillToggles(skills []Skill, included []string) []SkillToggle {
@@ -675,6 +857,21 @@ func indexesForwardFromMark(promptCount int, marks map[int]bool) []int {
 	return indexes
 }
 
+func indexesFromMarkInclusive(promptCount int, marks map[int]bool) ([]int, error) {
+	markedIndex, ok := currentMarkedIndex(marks)
+	if !ok {
+		return nil, errors.New("no marked prompt available")
+	}
+	if markedIndex < 0 || markedIndex >= promptCount {
+		return nil, fmt.Errorf("marked prompt index %d is out of bounds; highest prompt index is %d", markedIndex, promptCount-1)
+	}
+	indexes := make([]int, 0, promptCount-markedIndex)
+	for i := markedIndex; i < promptCount; i++ {
+		indexes = append(indexes, i)
+	}
+	return indexes, nil
+}
+
 func parseSelectedPromptIndexes(values []string, promptCount int) ([]int, error) {
 	if len(values) == 0 {
 		return nil, errors.New("select at least one prompt to compile")
@@ -699,6 +896,63 @@ func parseSelectedPromptIndexes(values []string, promptCount int) ([]int, error)
 
 	sort.Ints(selected)
 	return selected, nil
+}
+
+func resolveCompileIndexes(values url.Values, promptCount int) ([]int, error) {
+	mode := strings.TrimSpace(values.Get("mode"))
+	switch mode {
+	case "", "selected":
+		return parseSelectedPromptIndexes(values["prompt"], promptCount)
+	case "all":
+		indexes := make([]int, 0, promptCount)
+		for i := 0; i < promptCount; i++ {
+			indexes = append(indexes, i)
+		}
+		return indexes, nil
+	case "from_mark":
+		marks, err := loadMarks()
+		if err != nil {
+			return nil, err
+		}
+		return indexesFromMarkInclusive(promptCount, marks)
+	case "range":
+		start, err := strconv.Atoi(strings.TrimSpace(values.Get("range_start")))
+		if err != nil {
+			return nil, errors.New("range start must be a valid prompt index")
+		}
+		end, err := strconv.Atoi(strings.TrimSpace(values.Get("range_end")))
+		if err != nil {
+			return nil, errors.New("range end must be a valid prompt index")
+		}
+		return compileIndexesForRange(promptCount, compileRange{Start: start, End: end})
+	default:
+		return nil, errors.New("invalid compile mode")
+	}
+}
+
+func compileIndexesForRange(promptCount int, rng compileRange) ([]int, error) {
+	if rng.Start < 0 || rng.End < 0 {
+		return nil, errors.New("compile range indexes must be non-negative")
+	}
+	if rng.Start > rng.End {
+		return nil, errors.New("compile start index must be less than or equal to end index")
+	}
+	if promptCount == 0 {
+		return []int{}, nil
+	}
+	if rng.End >= promptCount {
+		return nil, fmt.Errorf("compile range out of bounds; highest prompt index is %d", promptCount-1)
+	}
+	indexes := make([]int, 0, rng.End-rng.Start+1)
+	for i := rng.Start; i <= rng.End; i++ {
+		indexes = append(indexes, i)
+	}
+	return indexes, nil
+}
+
+func shouldUpdateMark(values url.Values) bool {
+	raw := strings.TrimSpace(strings.ToLower(values.Get("update_mark")))
+	return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
 }
 
 func renderMarkdown(markdown string) string {
@@ -1084,6 +1338,12 @@ const baseStyles = `
     display: grid;
     gap: 0.55rem;
   }
+  .create-project-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(12rem, 1fr) auto;
+    gap: 0.85rem;
+    align-items: end;
+  }
   .filter-grid {
     display: grid;
     grid-template-columns: minmax(0, 1.7fr) repeat(2, minmax(10rem, 1fr)) auto;
@@ -1201,7 +1461,7 @@ const baseStyles = `
   [hidden] {
     display: none !important;
   }
-  textarea, input[type="text"], input[type="search"], input[type="date"], input[type="color"], select {
+  textarea, input[type="text"], input[type="search"], input[type="date"], input[type="number"], input[type="color"], select {
     width: 100%;
     border: 1px solid var(--border);
     background: #050505;
@@ -1221,6 +1481,29 @@ const baseStyles = `
   .form-grid {
     display: grid;
     gap: 0.7rem;
+  }
+  .compile-controls {
+    display: grid;
+    gap: 0.8rem;
+  }
+  .compile-controls-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8rem;
+    align-items: flex-end;
+  }
+  .compile-range-field {
+    flex: 0 1 8rem;
+    min-width: 7rem;
+  }
+  .compile-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 2.75rem;
+  }
+  .compile-toggle input {
+    margin: 0;
   }
   .label {
     display: grid;
@@ -1273,12 +1556,18 @@ const baseStyles = `
     margin-top: 0.7rem;
   }
   .project-list {
-    display: grid;
+    display: flex;
+    flex-wrap: wrap;
     gap: 0.75rem;
+    align-items: stretch;
   }
   .project-card {
     display: grid;
     gap: 0.7rem;
+    flex: 0 1 17rem;
+    min-width: 14rem;
+    padding: 0.8rem;
+    align-content: space-between;
   }
   .project-meta {
     display: grid;
@@ -1412,7 +1701,10 @@ const baseStyles = `
     .filter-grid {
       grid-template-columns: 1fr;
     }
-    details, .prompt-option, .prompt-card, .skill-card {
+    .create-project-grid {
+      grid-template-columns: 1fr;
+    }
+    details, .prompt-option, .prompt-card, .skill-card, .project-card {
       min-width: 100%;
       flex-basis: 100%;
     }
@@ -1428,33 +1720,6 @@ const liveReloadScript = `<script>
         window.location.reload();
       }
     };
-  })();
-  (function() {
-    document.addEventListener('keydown', function(event) {
-      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
-        return;
-      }
-      var target = event.target;
-      if (target && (
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.tagName === 'SELECT' ||
-        target.tagName === 'BUTTON' ||
-        target.isContentEditable
-      )) {
-        return;
-      }
-      if (!/^[1-9]$/.test(event.key)) {
-        return;
-      }
-      var links = Array.prototype.slice.call(document.querySelectorAll('.nav a'));
-      var index = parseInt(event.key, 10) - 1;
-      if (!links[index]) {
-        return;
-      }
-      event.preventDefault();
-      links[index].click();
-    });
   })();
 </script>`
 
@@ -1515,7 +1780,7 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       <form method="post" class="form-grid">
         <label class="label">
           <span>Title</span>
-          <input type="text" name="title" value="{{.Title}}">
+          <input id="new-prompt-title" type="text" name="title" value="{{.Title}}" autofocus>
         </label>
         <label class="label">
           <span>Body</span>
@@ -1527,6 +1792,16 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       </form>
     </section>
   </main>
+  <script>
+    (function() {
+      var input = document.getElementById('new-prompt-title');
+      if (!input) {
+        return;
+      }
+      input.focus();
+      input.select();
+    })();
+  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))
@@ -1569,6 +1844,7 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
         {{range .Skills}}
         <section class="skill-card">
           <div class="skill-card-title">{{.Name}}</div>
+          <textarea class="clipboard-source" readonly>{{.Body}}</textarea>
           <div class="actions">
             <button type="button" onclick="openSkillModal(this)">View skill</button>
           </div>
@@ -1590,6 +1866,7 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
                     <textarea name="skill_body">{{.Body}}</textarea>
                   </label>
                   <div class="modal-actions">
+                    <button type="button" onclick="copySkillBody(this)">Copy skill</button>
                     <button type="submit" class="primary">Update skill</button>
                   </div>
                 </form>
@@ -1634,6 +1911,27 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
         dialog.close();
       } else {
         dialog.removeAttribute('open');
+      }
+    }
+    function copySkillBody(button) {
+      var card = button ? button.closest('.skill-card') : null;
+      var source = card ? card.querySelector('.clipboard-source') : null;
+      if (!source) {
+        return;
+      }
+      var text = source.value || source.textContent || '';
+      function fallbackCopy() {
+        source.focus();
+        source.select();
+        try {
+          document.execCommand('copy');
+        } catch (err) {
+        }
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(fallbackCopy);
+      } else {
+        fallbackCopy();
       }
     }
   </script>
@@ -1699,6 +1997,130 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
 </body>
 </html>`))
 
+var instructionsTemplate = template.Must(template.New("instructions").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pmp instructions</title>
+  <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+    </nav>
+    ` + currentProjectBanner + `
+    {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
+    {{if .Saved}}<section class="panel success">saved</section>{{end}}
+    <section class="panel">
+      <form method="post" class="form-grid">
+        <div class="stack">
+          <h2 class="section-title">Instructions</h2>
+          <div class="instructions">This text is stored in <code>INSTRUCTIONS.md</code> for the current project.</div>
+          <div class="instructions">Keep it generic. It should explain how to use the compiled content, what the sections mean, and how response notes must be written back into <code>.pmp/responses/</code>.</div>
+          <div class="instructions">It is automatically prefixed onto every compilation before selected skills and prompts.</div>
+        </div>
+        <label class="label">
+          <span>Instruction text</span>
+          <textarea name="body">{{.Body}}</textarea>
+        </label>
+        <div class="actions spaced">
+          <button type="submit" class="primary">Save instructions</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  ` + liveReloadScript + `
+</body>
+</html>`))
+
+var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pmp responses</title>
+  <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+    </nav>
+    ` + currentProjectBanner + `
+    <section class="panel compact">
+      <div>{{.TotalResponses}} responses</div>
+      <div class="instructions">Response notes are markdown files read from <code>.pmp/responses/</code>.</div>
+    </section>
+    <section class="panel stack">
+      <div class="prompt-grid">
+        {{range .Responses}}
+        <section class="prompt-card" data-date="{{.DateValue}}">
+          <div class="prompt-card-copy">
+            <strong>{{.Title}}</strong>
+            <span class="small">{{.Timestamp}}</span>
+          </div>
+          <div class="actions">
+            <button type="button" onclick="openResponseModal('{{.ElementID}}')">View</button>
+          </div>
+          <div id="{{.ElementID}}-content" hidden>{{.HTMLBody}}</div>
+          <dialog id="{{.ElementID}}" class="prompt-modal">
+            <div class="modal-shell">
+              <div class="modal-header">
+                <div>
+                  <div class="summary-title">{{.Title}}</div>
+                  <div class="summary-meta">{{.Timestamp}}</div>
+                </div>
+                <button type="button" onclick="closeResponseModal('{{.ElementID}}')">Close</button>
+              </div>
+              <div class="modal-body" id="{{.ElementID}}-body"></div>
+            </div>
+          </dialog>
+        </section>
+        {{else}}
+        <section class="panel">
+          <div class="muted">No responses yet.</div>
+        </section>
+        {{end}}
+      </div>
+    </section>
+  </main>
+  <script>
+    function openResponseModal(id) {
+      var dialog = document.getElementById(id);
+      var body = document.getElementById(id + '-body');
+      var content = document.getElementById(id + '-content');
+      if (!dialog || !body || !content) {
+        return;
+      }
+      body.innerHTML = content.innerHTML;
+      if (typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute('open', 'open');
+      }
+    }
+    function closeResponseModal(id) {
+      var dialog = document.getElementById(id);
+      if (!dialog) {
+        return;
+      }
+      if (typeof dialog.close === 'function') {
+        dialog.close();
+      } else {
+        dialog.removeAttribute('open');
+      }
+    }
+  </script>
+  ` + liveReloadScript + `
+</body>
+</html>`))
+
 var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -1717,16 +2139,39 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
     ` + currentProjectBanner + `
     <section class="panel compact">
       <div>{{.TotalPrompts}} prompts{{if .HasMark}} · marked {{.MarkedIndex}}{{end}}</div>
-      <div class="actions">
-        <button type="button" onclick="setAll(true)">Select all</button>
-        {{if .HasMark}}<button type="button" onclick="selectFromMark()">Select from mark</button>{{end}}
-        {{if .HasMark}}<button type="button" onclick="compileFromMark()">Compile from mark</button>{{end}}
-        <button type="button" onclick="setAll(false)">Clear all</button>
-      </div>
+      <div class="instructions">Compile all prompts, from the mark, or an inclusive range.</div>
     </section>
     {{if .Copied}}
     <section class="panel success">compiled to clipboard</section>
     {{end}}
+    <section class="panel stack">
+      <div class="compile-controls">
+        <div>
+          <h2 class="section-title">Compile Controls</h2>
+          <div class="instructions">Prompt indexes are shown on each card. Range values are inclusive.</div>
+        </div>
+        <div id="compile-error-anchor"></div>
+        <div class="compile-controls-row">
+          <label class="label compile-range-field">
+            <span>Range start</span>
+            <input id="compile-range-start" type="number" min="0" placeholder="0">
+          </label>
+          <label class="label compile-range-field">
+            <span>Range end</span>
+            <input id="compile-range-end" type="number" min="0" placeholder="0">
+          </label>
+          <label class="compile-toggle">
+            <input id="compile-update-mark" type="checkbox" checked>
+            <span>Update mark after compile</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" onclick="startCompileAll()">Compile all</button>
+          <button type="button" onclick="startCompileFromMark()">Compile from mark</button>
+          <button type="button" onclick="startCompileRange()">Compile range</button>
+        </div>
+      </div>
+    </section>
     <section class="panel prompt-filters">
       <div class="filter-grid">
         <label class="label">
@@ -1748,19 +2193,12 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
       <div class="small">Showing <span id="visible-prompt-count">{{.TotalPrompts}}</span> of {{.TotalPrompts}} prompts</div>
     </section>
     <section class="panel stack">
-      <form id="compile-form" method="post" class="stack">
-        <div class="actions spaced">
-          <button type="submit" class="primary">Compile selected prompts</button>
-        </div>
         <div class="prompt-grid" {{if .HasMark}}data-marked-index="{{.MarkedIndex}}"{{end}}>
           {{range .Prompts}}
           <section class="prompt-card {{if .Marked}}marked{{end}}" data-search="{{.SearchText}}" data-date="{{.DateValue}}">
-            <div class="prompt-card-header">
-              <input type="checkbox" name="prompt" value="{{.Index}}" data-index="{{.Index}}" {{if .Checked}}checked{{end}}>
-              <div class="prompt-card-copy">
-                <strong>{{.Title}}</strong>{{if .Marked}} <span class="mark-badge">marked</span>{{end}}
-                <span class="small">#{{.Index}} · {{.Timestamp}}</span>
-              </div>
+            <div class="prompt-card-copy">
+              <strong>{{.Title}}</strong>{{if .Marked}} <span class="mark-badge">marked</span>{{end}}
+              <span class="small">#{{.Index}} · {{.Timestamp}}</span>
             </div>
             <div class="actions">
               <button type="button" onclick="openPromptModal('{{.ElementID}}')">View</button>
@@ -1778,7 +2216,7 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
                 <div class="modal-body" id="{{.ElementID}}-body"></div>
                 <div class="prompt-actions">
                   <form method="post" action="/prompts/delete">
-                    <input type="hidden" name="index" value="{{.Index}}">
+                    <input type="hidden" name="delete_prompt" value="{{.Index}}">
                     <button type="submit" class="danger">Delete</button>
                   </form>
                 </div>
@@ -1791,7 +2229,6 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
           </section>
           {{end}}
         </div>
-      </form>
     </section>
     {{if .Skills}}
     <dialog id="compile-skill-modal" class="prompt-modal">
@@ -1821,9 +2258,6 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
     {{end}}
   </main>
   <script>
-    function promptGridElement() {
-      return document.querySelector('.prompt-grid');
-    }
     var pendingCompileRequest = null;
     function compileSkillDialog() {
       return document.getElementById('compile-skill-modal');
@@ -1840,13 +2274,6 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
       var filters = promptFilterElements();
       return filters.search ? filters.search.value.trim() : '';
     }
-	    function markedIndex() {
-	      var picker = promptGridElement();
-	      if (!picker) {
-	        return NaN;
-	      }
-	      return parseInt(picker.getAttribute('data-marked-index'), 10);
-	    }
     function highlightPromptSearch(container, term) {
       if (!container || !term) {
         return;
@@ -1954,19 +2381,14 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
           dialog.removeAttribute('open');
         }
       }
-      function openCompileSkillModal(params, emptyMessage) {
-        if (!params.has('prompt')) {
-          showCompileError(emptyMessage);
-          return;
-        }
+      function openCompileSkillModal(params) {
         var dialog = compileSkillDialog();
         if (!dialog) {
-          submitCompile(params, emptyMessage);
+          submitCompile(params);
           return;
         }
         pendingCompileRequest = {
-          params: params,
-          emptyMessage: emptyMessage,
+          params: params
         };
         if (typeof dialog.showModal === 'function') {
           dialog.showModal();
@@ -1989,39 +2411,25 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
       }
       function confirmCompileWithSkills() {
         var params = pendingCompileRequest ? new URLSearchParams(pendingCompileRequest.params.toString()) : new URLSearchParams();
-        var emptyMessage = pendingCompileRequest ? pendingCompileRequest.emptyMessage : 'select at least one prompt to compile';
         document.querySelectorAll('input[name="modal_include_skill"]').forEach(function(el) {
           if (el.checked) {
             params.append('include_skill', el.value);
           }
         });
         closeCompileSkillModal();
-        submitCompile(params, emptyMessage);
+        submitCompile(params);
       }
-	    function createParamsFromSelection(predicate) {
-	      var params = new URLSearchParams();
-	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
-	        if (predicate(el)) {
-	          params.append('prompt', el.value);
-	        }
-	      });
-	      return params;
-	    }
 	    function showCompileError(message) {
-	      var form = document.getElementById('compile-form');
+	      var anchor = document.getElementById('compile-error-anchor');
 	      var error = document.querySelector('.error');
 	      if (!error) {
 	        error = document.createElement('section');
 	        error.className = 'panel error';
-	        form.parentNode.parentNode.insertBefore(error, form.parentNode);
+	        anchor.parentNode.insertBefore(error, anchor.nextSibling);
 	      }
 	      error.textContent = message;
 	    }
-	    function submitCompile(params, emptyMessage) {
-	      if (!params.has('prompt')) {
-	        showCompileError(emptyMessage);
-	        return;
-	      }
+	    function submitCompile(params) {
 	      fetch('/compile', {
 	        method: 'POST',
 	        headers: {
@@ -2058,38 +2466,35 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
 	        }
 	      });
 	    }
-	    function setAll(checked) {
-	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
-	        el.checked = checked;
-	      });
-	    }
-	    function selectFromMark() {
-	      var mark = markedIndex();
-	      if (Number.isNaN(mark)) {
-	        return;
-	      }
-	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
-	        var index = parseInt(el.getAttribute('data-index'), 10);
-	        el.checked = !Number.isNaN(index) && index > mark;
-	      });
-	    }
-	    function compileFromMark() {
-	      var mark = markedIndex();
-	      if (Number.isNaN(mark)) {
-	        return;
-	      }
-	      var params = createParamsFromSelection(function(el) {
-	        var index = parseInt(el.getAttribute('data-index'), 10);
-	        return !Number.isNaN(index) && index > mark;
-	      });
-        openCompileSkillModal(params, 'no prompts found after the marked prompt');
-	    }
-	    document.getElementById('compile-form').addEventListener('submit', function(event) {
-	      event.preventDefault();
-	      openCompileSkillModal(createParamsFromSelection(function(el) {
-	        return el.checked;
-	      }), 'select at least one prompt to compile');
-	    });
+      function baseCompileParams(mode) {
+        var params = new URLSearchParams();
+        params.set('mode', mode);
+        var updateMark = document.getElementById('compile-update-mark');
+        if (updateMark && updateMark.checked) {
+          params.set('update_mark', '1');
+        }
+        return params;
+      }
+      function startCompileAll() {
+        openCompileSkillModal(baseCompileParams('all'));
+      }
+      function startCompileFromMark() {
+        openCompileSkillModal(baseCompileParams('from_mark'));
+      }
+      function startCompileRange() {
+        var startInput = document.getElementById('compile-range-start');
+        var endInput = document.getElementById('compile-range-end');
+        var startValue = startInput ? startInput.value.trim() : '';
+        var endValue = endInput ? endInput.value.trim() : '';
+        if (startValue === '' || endValue === '') {
+          showCompileError('range start and end are required');
+          return;
+        }
+        var params = baseCompileParams('range');
+        params.set('range_start', startValue);
+        params.set('range_end', endValue);
+        openCompileSkillModal(params);
+      }
     ['prompt-search', 'prompt-date-from', 'prompt-date-to'].forEach(function(id) {
       var el = document.getElementById(id);
       if (!el) {
@@ -2121,6 +2526,31 @@ var projectsTemplate = template.Must(template.New("projects").Parse(`<!doctype h
     </nav>
     ` + currentProjectBanner + `
     {{if .Switched}}<section class="panel success">project switched</section>{{end}}
+    {{if .Created}}<section class="panel success">project created</section>{{end}}
+    {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
+    <section class="panel stack">
+      <div>
+        <h2 class="section-title">Create New Project</h2>
+        <div class="instructions">Choose one of your configured scan roots, create the folder, and initialize PMP in it immediately.</div>
+      </div>
+      <form method="post" action="/projects/create" class="create-project-grid">
+        <label class="label">
+          <span>Project name</span>
+          <input type="text" name="project_name" value="{{.NewProjectName}}" placeholder="my-new-project">
+        </label>
+        <label class="label">
+          <span>Location</span>
+          <select name="project_root">
+            {{range .ScanRoots}}
+            <option value="{{.}}" {{if eq $.NewProjectRoot .}}selected{{end}}>{{.}}</option>
+            {{end}}
+          </select>
+        </label>
+        <div class="actions">
+          <button type="submit" class="primary">Create project</button>
+        </div>
+      </form>
+    </section>
     <section class="panel stack">
       <div>
         <h2 class="section-title">Projects On This Machine</h2>
