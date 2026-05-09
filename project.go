@@ -4,15 +4,16 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 )
 
 const (
-	projectDirName        = ".pmp"
-	promptsDirName        = "prompts"
-	draftFileName         = "draft.md"
-	marksFileName         = "marks.txt"
-	prefixFileName        = "prefix.md"
-	projectNoteFileName   = "PROJECT.md"
+	projectDirName      = ".pmp"
+	promptsDirName      = "prompts"
+	draftFileName       = "draft.md"
+	marksFileName       = "marks.txt"
+	projectNoteFileName = "PROJECT.md"
 )
 
 const projectNoteContents = `# PROJECT
@@ -27,8 +28,8 @@ The tool stores prompts in chronological order so the full history of a project 
 
 - ` + "`.pmp/prompts/`" + ` contains saved prompt files as markdown with frontmatter.
 - ` + "`.pmp/marks.txt`" + ` stores marked prompt indexes used by the CLI today.
-- ` + "`.pmp/prefix.md`" + ` stores markdown that is prefixed to every compilation.
-- system settings such as audio keywords and theme accent are stored in the user config directory for ` + "`pmp`" + `.
+- system-wide skills are stored in the user config directory for ` + "`pmp`" + ` and can be opted into during compilation.
+- system settings such as theme accent and project scan roots are stored in the user config directory for ` + "`pmp`" + `.
 
 ## Prompt format
 
@@ -47,12 +48,40 @@ The body contains the original prompt text and should begin with a markdown head
 - ` + "`pmp serve`" + ` opens the local browser UI for browsing and compiling prompts.
 `
 
+var projectRootState struct {
+	mu       sync.RWMutex
+	override string
+}
+
 func projectRoot() (string, error) {
+	projectRootState.mu.RLock()
+	override := projectRootState.override
+	projectRootState.mu.RUnlock()
+	if strings.TrimSpace(override) != "" {
+		return override, nil
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
 	return wd, nil
+}
+
+func setProjectRootOverride(root string) error {
+	absRoot, err := filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return err
+	}
+	projectRootState.mu.Lock()
+	projectRootState.override = filepath.Clean(absRoot)
+	projectRootState.mu.Unlock()
+	return nil
+}
+
+func clearProjectRootOverride() {
+	projectRootState.mu.Lock()
+	projectRootState.override = ""
+	projectRootState.mu.Unlock()
 }
 
 func projectPaths() (base string, prompts string, draft string, err error) {
@@ -93,12 +122,7 @@ func runInit() error {
 	} else if err != nil {
 		return err
 	}
-	prefix := filepath.Join(base, prefixFileName)
-	if _, err := os.Stat(prefix); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(prefix, nil, 0o644); err != nil {
-			return err
-		}
-	} else if err != nil {
+	if _, err := ensureSkillsStorage(); err != nil {
 		return err
 	}
 	projectNotePath := filepath.Join(root, projectNoteFileName)
@@ -107,6 +131,9 @@ func runInit() error {
 			return err
 		}
 	} else if err != nil {
+		return err
+	}
+	if err := registerProject(root); err != nil {
 		return err
 	}
 	_, _ = os.Stdout.WriteString("initialized " + base + "\n")
@@ -123,10 +150,16 @@ func ensureProjectInitialized() error {
 }
 
 func ensureProject() error {
-	base, prompts, _, err := projectPaths()
+	root, err := projectRoot()
 	if err != nil {
 		return err
 	}
+	return ensureProjectAtRoot(root)
+}
+
+func ensureProjectAtRoot(root string) error {
+	base := filepath.Join(root, projectDirName)
+	prompts := filepath.Join(base, promptsDirName)
 	if _, err := os.Stat(base); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return errors.New("project not initialized; run `pmp init` first")
@@ -148,12 +181,4 @@ func marksPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(base, marksFileName), nil
-}
-
-func prefixPath() (string, error) {
-	base, _, _, err := projectPaths()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, prefixFileName), nil
 }

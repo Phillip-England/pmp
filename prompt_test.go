@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,7 +62,7 @@ func TestFormatAndReadPromptFile(t *testing.T) {
 	}
 }
 
-func TestBuildPagePaginates(t *testing.T) {
+func TestBuildPageShowsAllPromptsNewestFirst(t *testing.T) {
 	prompts := make([]Prompt, 51)
 	for i := range prompts {
 		prompts[i] = Prompt{
@@ -71,18 +72,18 @@ func TestBuildPagePaginates(t *testing.T) {
 		}
 	}
 
-	page, err := buildPage(prompts, map[int]bool{}, 2)
+	page, err := buildPage(prompts, map[int]bool{})
 	if err != nil {
 		t.Fatalf("buildPage returned error: %v", err)
 	}
-	if len(page.Prompts) != 1 {
-		t.Fatalf("expected 1 prompt on second page, got %d", len(page.Prompts))
+	if len(page.Prompts) != 51 {
+		t.Fatalf("expected all prompts on page, got %d", len(page.Prompts))
 	}
-	if page.TotalPages != 2 {
-		t.Fatalf("expected 2 pages, got %d", page.TotalPages)
+	if page.Prompts[0].Index != 50 {
+		t.Fatalf("expected newest prompt first, got %d", page.Prompts[0].Index)
 	}
-	if page.Prompts[0].Index != 0 {
-		t.Fatalf("expected newest prompt on page 2 to be index 0, got %d", page.Prompts[0].Index)
+	if page.Prompts[len(page.Prompts)-1].Index != 0 {
+		t.Fatalf("expected oldest prompt last, got %d", page.Prompts[len(page.Prompts)-1].Index)
 	}
 }
 
@@ -100,7 +101,7 @@ func TestCompilePromptsAll(t *testing.T) {
 		},
 	}
 
-	compiled, err := compilePrompts(prompts, nil, "")
+	compiled, err := compilePrompts(prompts, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("compilePrompts returned error: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestCompilePromptsRange(t *testing.T) {
 		{Title: "Two", Timestamp: time.Date(2026, 5, 8, 12, 2, 0, 0, time.UTC), Markdown: "# Two\n\nC\n"},
 	}
 
-	compiled, err := compilePrompts(prompts, &compileRange{Start: 1, End: 2}, "")
+	compiled, err := compilePrompts(prompts, &compileRange{Start: 1, End: 2}, nil, nil)
 	if err != nil {
 		t.Fatalf("compilePrompts returned error: %v", err)
 	}
@@ -136,7 +137,7 @@ func TestCompilePromptsRejectsInvalidRange(t *testing.T) {
 		{Title: "Zero", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Zero\n\nA\n"},
 	}
 
-	_, err := compilePrompts(prompts, &compileRange{Start: 1, End: 1}, "")
+	_, err := compilePrompts(prompts, &compileRange{Start: 1, End: 1}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "out of bounds") {
 		t.Fatalf("expected out of bounds error, got %v", err)
 	}
@@ -149,7 +150,7 @@ func TestCompilePromptIndexesSortsSelection(t *testing.T) {
 		{Title: "Two", Timestamp: time.Date(2026, 5, 8, 12, 2, 0, 0, time.UTC), Markdown: "# Two\n\nC\n"},
 	}
 
-	compiled, err := compilePromptIndexes(prompts, []int{2, 0}, "")
+	compiled, err := compilePromptIndexes(prompts, []int{2, 0}, nil, nil)
 	if err != nil {
 		t.Fatalf("compilePromptIndexes returned error: %v", err)
 	}
@@ -181,17 +182,39 @@ func TestParseCompileArgs(t *testing.T) {
 	}
 }
 
-func TestCompilePromptIndexesIncludesPrefix(t *testing.T) {
+func TestCompilePromptIndexesIncludesSkills(t *testing.T) {
 	prompts := []Prompt{
 		{Title: "Zero", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Zero\n\nA\n"},
 	}
 
-	compiled, err := compilePromptIndexes(prompts, []int{0}, "# Prefix\n\nIntro")
+	skills := []Skill{{Name: "ui", Body: "# UI Skill\n\nIntro"}}
+	compiled, err := compilePromptIndexes(prompts, []int{0}, skills, []string{"ui"})
 	if err != nil {
 		t.Fatalf("compilePromptIndexes returned error: %v", err)
 	}
-	if !strings.HasPrefix(compiled, "# Prefix\n\nIntro\n\n<!-- prompt 0") {
-		t.Fatalf("expected prefix at top, got %q", compiled)
+	if !strings.HasPrefix(compiled, "# UI Skill\n\nIntro\n\n<!-- prompt 0") {
+		t.Fatalf("expected skills at top, got %q", compiled)
+	}
+}
+
+func TestCompilePromptIndexesIncludesOnlySelectedSkills(t *testing.T) {
+	prompts := []Prompt{
+		{Title: "Zero", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Zero\n\nA\n"},
+	}
+	skills := []Skill{
+		{Name: "ui", Body: "# UI Skill"},
+		{Name: "backend", Body: "# Backend Skill"},
+	}
+
+	compiled, err := compilePromptIndexes(prompts, []int{0}, skills, []string{"ui"})
+	if err != nil {
+		t.Fatalf("compilePromptIndexes returned error: %v", err)
+	}
+	if strings.Contains(compiled, "# Backend Skill") {
+		t.Fatalf("did not expect unselected skill in output: %q", compiled)
+	}
+	if !strings.Contains(compiled, "# UI Skill") {
+		t.Fatalf("expected selected skill in output: %q", compiled)
 	}
 }
 
@@ -252,18 +275,19 @@ func TestParseSelectedPromptIndexesRequiresSelection(t *testing.T) {
 	}
 }
 
-func TestBuildCompileOptionsDefaultToUnchecked(t *testing.T) {
-	prompts := []Prompt{
-		{Title: "Zero", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)},
-		{Title: "One", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC)},
+func TestBuildSkillTogglesMarksIncludedSkills(t *testing.T) {
+	toggles := buildSkillToggles([]Skill{
+		{Name: "ui"},
+		{Name: "backend"},
+	}, []string{"backend"})
+	if len(toggles) != 2 {
+		t.Fatalf("expected 2 skill toggles, got %d", len(toggles))
 	}
-
-	options := buildCompileOptions(prompts, map[int]bool{}, nil)
-	if len(options) != 2 {
-		t.Fatalf("expected 2 options, got %d", len(options))
+	if toggles[0].Included {
+		t.Fatalf("did not expect first skill to be included: %#v", toggles)
 	}
-	if options[0].Checked || options[1].Checked {
-		t.Fatalf("expected all options to be unchecked by default: %#v", options)
+	if !toggles[1].Included {
+		t.Fatalf("expected second skill to be included: %#v", toggles)
 	}
 }
 
@@ -273,7 +297,7 @@ func TestBuildPageMarksVisiblePrompt(t *testing.T) {
 		{Title: "One", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# One\n\nB\n"},
 	}
 
-	page, err := buildPage(prompts, map[int]bool{1: true}, 1)
+	page, err := buildPage(prompts, map[int]bool{1: true})
 	if err != nil {
 		t.Fatalf("buildPage returned error: %v", err)
 	}
@@ -393,7 +417,7 @@ func TestEnsureProjectInitializedCreatesProject(t *testing.T) {
 	}
 }
 
-func TestLoadPrefixCreatesMissingFile(t *testing.T) {
+func TestLoadSkillsCreatesMissingDirectory(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd returned error: %v", err)
@@ -409,27 +433,58 @@ func TestLoadPrefixCreatesMissingFile(t *testing.T) {
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
 	}
-	path, err := prefixPath()
+	path, err := skillsPath()
 	if err != nil {
-		t.Fatalf("prefixPath returned error: %v", err)
+		t.Fatalf("skillsPath returned error: %v", err)
 	}
-	if err := os.Remove(path); err != nil {
-		t.Fatalf("Remove returned error: %v", err)
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("RemoveAll returned error: %v", err)
 	}
 
-	prefix, err := loadPrefix()
+	skills, err := loadSkills()
 	if err != nil {
-		t.Fatalf("loadPrefix returned error: %v", err)
+		t.Fatalf("loadSkills returned error: %v", err)
 	}
-	if prefix != "" {
-		t.Fatalf("expected empty prefix, got %q", prefix)
+	if len(skills) != 0 {
+		t.Fatalf("expected no skills, got %#v", skills)
 	}
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected recreated prefix file, got %v", err)
+		t.Fatalf("expected recreated skills directory, got %v", err)
 	}
 }
 
-func TestLoadAudioSettingsCreatesDefaultFile(t *testing.T) {
+func TestSaveSkillPersistsAndLoads(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if err := saveSkill("ui-guidelines", "# UI\n\nRules"); err != nil {
+		t.Fatalf("saveSkill returned error: %v", err)
+	}
+	skills, err := loadSkills()
+	if err != nil {
+		t.Fatalf("loadSkills returned error: %v", err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("expected 1 skill, got %#v", skills)
+	}
+	if skills[0].Name != "ui-guidelines" || !strings.Contains(skills[0].Body, "Rules") {
+		t.Fatalf("unexpected skills %#v", skills)
+	}
+}
+
+func TestLoadSystemSettingsCreatesDefaultFile(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd returned error: %v", err)
@@ -452,8 +507,8 @@ func TestLoadAudioSettingsCreatesDefaultFile(t *testing.T) {
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
 	}
-	if _, err := loadAudioSettings(); err != nil {
-		t.Fatalf("loadAudioSettings returned error: %v", err)
+	if _, err := loadSystemSettings(); err != nil {
+		t.Fatalf("loadSystemSettings returned error: %v", err)
 	}
 	path, err := systemSettingsPath()
 	if err != nil {
@@ -463,15 +518,15 @@ func TestLoadAudioSettingsCreatesDefaultFile(t *testing.T) {
 		t.Fatalf("Remove returned error: %v", err)
 	}
 
-	settings, err := loadAudioSettings()
+	settings, err := loadSystemSettings()
 	if err != nil {
-		t.Fatalf("loadAudioSettings returned error: %v", err)
+		t.Fatalf("loadSystemSettings returned error: %v", err)
 	}
-	if settings.SplitWord != "dash" || settings.SaveWord != "cucumber" {
+	if settings.Theme.AccentColor != "#8fd18a" {
 		t.Fatalf("unexpected settings %#v", settings)
 	}
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected recreated audio settings file, got %v", err)
+		t.Fatalf("expected recreated system settings file, got %v", err)
 	}
 }
 
@@ -532,5 +587,221 @@ func TestWriteCompileJSONError(t *testing.T) {
 func TestServeAddressIsConsistent(t *testing.T) {
 	if serveAddress != "127.0.0.1:8765" {
 		t.Fatalf("unexpected serve address %q", serveAddress)
+	}
+}
+
+func TestDiscoverProjectsPreservesRegisteredNonTemporaryProjects(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+
+	projectOne := filepath.Join("/Users", "example", "work", "project-one")
+	if err := registerProject(projectOne); err != nil {
+		t.Fatalf("registerProject returned error: %v", err)
+	}
+
+	projects, err := discoverProjects()
+	if err != nil {
+		t.Fatalf("discoverProjects returned error: %v", err)
+	}
+
+	found := false
+	for _, project := range projects {
+		if filepath.Clean(project.Path) == filepath.Clean(projectOne) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected retained registered project, got %#v", projects)
+	}
+}
+
+func TestServeProjectSwitchUpdatesActiveProject(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectA := filepath.Join(t.TempDir(), "alpha")
+	projectB := filepath.Join(t.TempDir(), "beta")
+	if err := os.MkdirAll(filepath.Join(projectA, projectDirName, promptsDirName), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectB, projectDirName, promptsDirName), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := setProjectRootOverride(projectA); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/projects/switch?path="+url.QueryEscape(projectB), nil)
+	serveProjectSwitch(rec, req)
+
+	if rec.Code != 303 {
+		t.Fatalf("expected redirect status, got %d", rec.Code)
+	}
+	if location := rec.Header().Get("Location"); location != "/projects?switched=1" {
+		t.Fatalf("unexpected redirect location %q", location)
+	}
+	root, err := projectRoot()
+	if err != nil {
+		t.Fatalf("projectRoot returned error: %v", err)
+	}
+	if filepath.Clean(root) != filepath.Clean(projectB) {
+		t.Fatalf("expected switched project root %q, got %q", projectB, root)
+	}
+}
+
+func TestRegisterProjectSkipsTemporaryDirectories(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+
+	tempProject := filepath.Join(os.TempDir(), "TestRunInitCreatesProjectNote2813074405", "001")
+	if err := registerProject(tempProject); err != nil {
+		t.Fatalf("registerProject returned error: %v", err)
+	}
+
+	projects, err := loadRegisteredProjects()
+	if err != nil {
+		t.Fatalf("loadRegisteredProjects returned error: %v", err)
+	}
+	if len(projects) != 0 {
+		t.Fatalf("expected temp project to be ignored, got %#v", projects)
+	}
+}
+
+func TestNormalizeRegisteredProjectsDropsMacTempEntries(t *testing.T) {
+	projects := normalizeRegisteredProjects([]registeredProject{
+		{
+			Name:       "001",
+			Path:       "/private/var/folders/sk/841zd5z92vg8tf2zw1__wr4c0000gn/T/TestRunInitCreatesProjectNote2813074405/001",
+			LastOpened: time.Date(2026, 5, 9, 15, 49, 39, 0, time.UTC),
+		},
+		{
+			Name:       "real-project",
+			Path:       "/Users/example/src/real-project",
+			LastOpened: time.Date(2026, 5, 9, 15, 50, 0, 0, time.UTC),
+		},
+	})
+
+	if len(projects) != 1 {
+		t.Fatalf("expected one retained project, got %#v", projects)
+	}
+	if filepath.Clean(projects[0].Path) != "/Users/example/src/real-project" {
+		t.Fatalf("unexpected surviving project %#v", projects[0])
+	}
+}
+
+func TestNormalizeProjectSettingsDefaultsAndDeduplicatesRoots(t *testing.T) {
+	homeDir := filepath.Join(string(filepath.Separator), "Users", "example")
+	if err := os.Setenv("HOME", homeDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("HOME")
+	}()
+
+	settings := normalizeProjectSettings(ProjectSettings{
+		ScanRoots: []string{
+			filepath.Join(homeDir, "Desktop", "src"),
+			filepath.Join(homeDir, "Desktop", "src"),
+			filepath.Join(os.TempDir(), "ignored"),
+			"",
+		},
+	})
+
+	if len(settings.ScanRoots) != 1 {
+		t.Fatalf("expected one retained scan root, got %#v", settings.ScanRoots)
+	}
+	if filepath.Clean(settings.ScanRoots[0]) != filepath.Join(homeDir, "Desktop", "src") {
+		t.Fatalf("unexpected scan roots %#v", settings.ScanRoots)
+	}
+
+	settings = normalizeProjectSettings(ProjectSettings{})
+	if len(settings.ScanRoots) == 0 {
+		t.Fatalf("expected default project scan roots, got %#v", settings.ScanRoots)
+	}
+}
+
+func TestDiscoverProjectsScansConfiguredRootsOnly(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+
+	scanRoot, err := os.MkdirTemp(wd, "scan-root-")
+	if err != nil {
+		t.Fatalf("MkdirTemp returned error: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(scanRoot)
+	}()
+	otherRoot, err := os.MkdirTemp(wd, "other-root-")
+	if err != nil {
+		t.Fatalf("MkdirTemp returned error: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(otherRoot)
+	}()
+
+	projectOne := filepath.Join(scanRoot, "project-one")
+	projectTwo := filepath.Join(otherRoot, "project-two")
+	if err := os.MkdirAll(filepath.Join(projectOne, projectDirName, promptsDirName), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectTwo, projectDirName, promptsDirName), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+
+	settings := defaultSystemSettings()
+	settings.Projects = normalizeProjectSettings(ProjectSettings{
+		ScanRoots: []string{scanRoot},
+	})
+	if err := saveSystemSettings(settings); err != nil {
+		t.Fatalf("saveSystemSettings returned error: %v", err)
+	}
+
+	projects, err := discoverProjects()
+	if err != nil {
+		t.Fatalf("discoverProjects returned error: %v", err)
+	}
+
+	foundOne := false
+	foundTwo := false
+	for _, project := range projects {
+		switch filepath.Clean(project.Path) {
+		case filepath.Clean(projectOne):
+			foundOne = true
+		case filepath.Clean(projectTwo):
+			foundTwo = true
+		}
+	}
+	if !foundOne {
+		t.Fatalf("expected configured-root project in discovery result, got %#v", projects)
+	}
+	if foundTwo {
+		t.Fatalf("did not expect project outside configured roots, got %#v", projects)
 	}
 }

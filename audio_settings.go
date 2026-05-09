@@ -9,30 +9,21 @@ import (
 )
 
 const systemSettingsFileName = "settings.json"
-const legacyAudioSettingsFileName = "audio-settings.json"
-
-type AudioSettings struct {
-	SplitWord string `json:"split_word"`
-	SaveWord  string `json:"save_word"`
-}
 
 type ThemeSettings struct {
 	AccentColor string `json:"accent_color"`
 }
 
+type ProjectSettings struct {
+	ScanRoots []string `json:"scan_roots"`
+}
+
 type SystemSettings struct {
-	Audio AudioSettings `json:"audio"`
-	Theme ThemeSettings `json:"theme"`
+	Theme    ThemeSettings   `json:"theme"`
+	Projects ProjectSettings `json:"projects"`
 }
 
 var hexColorPattern = regexp.MustCompile(`^#[0-9a-f]{6}$`)
-
-func defaultAudioSettings() AudioSettings {
-	return AudioSettings{
-		SplitWord: "dash",
-		SaveWord:  "cucumber",
-	}
-}
 
 func defaultThemeSettings() ThemeSettings {
 	return ThemeSettings{AccentColor: "#8fd18a"}
@@ -40,22 +31,13 @@ func defaultThemeSettings() ThemeSettings {
 
 func defaultSystemSettings() SystemSettings {
 	return SystemSettings{
-		Audio: defaultAudioSettings(),
-		Theme: defaultThemeSettings(),
+		Theme:    defaultThemeSettings(),
+		Projects: defaultProjectSettings(),
 	}
 }
 
-func normalizeAudioSettings(settings AudioSettings) AudioSettings {
-	defaults := defaultAudioSettings()
-	settings.SplitWord = strings.TrimSpace(settings.SplitWord)
-	settings.SaveWord = strings.TrimSpace(settings.SaveWord)
-	if settings.SplitWord == "" {
-		settings.SplitWord = defaults.SplitWord
-	}
-	if settings.SaveWord == "" {
-		settings.SaveWord = defaults.SaveWord
-	}
-	return settings
+func defaultProjectSettings() ProjectSettings {
+	return ProjectSettings{ScanRoots: defaultProjectScanRoots()}
 }
 
 func normalizeThemeSettings(settings ThemeSettings) ThemeSettings {
@@ -67,28 +49,75 @@ func normalizeThemeSettings(settings ThemeSettings) ThemeSettings {
 	return defaults
 }
 
-func normalizeSystemSettings(settings SystemSettings) SystemSettings {
-	settings.Audio = normalizeAudioSettings(settings.Audio)
-	settings.Theme = normalizeThemeSettings(settings.Theme)
+func defaultProjectScanRoots() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return nil
+	}
+	return normalizeProjectScanRoots([]string{
+		filepath.Join(home, "Desktop", "src"),
+		filepath.Join(home, "Projects"),
+		filepath.Join(home, "Documents", "Projects"),
+	})
+}
+
+func normalizeProjectScanRoots(roots []string) []string {
+	seen := map[string]bool{}
+	normalized := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		absRoot = filepath.Clean(absRoot)
+		if shouldIgnoreProjectPath(absRoot) || seen[absRoot] {
+			continue
+		}
+		seen[absRoot] = true
+		normalized = append(normalized, absRoot)
+	}
+	return normalized
+}
+
+func normalizeProjectSettings(settings ProjectSettings) ProjectSettings {
+	settings.ScanRoots = normalizeProjectScanRoots(settings.ScanRoots)
+	if len(settings.ScanRoots) == 0 {
+		settings.ScanRoots = defaultProjectScanRoots()
+	}
 	return settings
 }
 
-func systemSettingsPath() (string, error) {
+func normalizeSystemSettings(settings SystemSettings) SystemSettings {
+	settings.Theme = normalizeThemeSettings(settings.Theme)
+	settings.Projects = normalizeProjectSettings(settings.Projects)
+	return settings
+}
+
+func configRootDir() (string, error) {
 	if override := strings.TrimSpace(os.Getenv("PMP_CONFIG_HOME")); override != "" {
-		return filepath.Join(override, systemSettingsFileName), nil
+		return override, nil
 	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(configDir, "pmp", systemSettingsFileName), nil
+	return filepath.Join(configDir, "pmp"), nil
+}
+
+func systemSettingsPath() (string, error) {
+	root, err := configRootDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, systemSettingsFileName), nil
 }
 
 func writeDefaultSystemSettings(path string) error {
-	settings, err := initialSystemSettings()
-	if err != nil {
-		return err
-	}
+	settings := defaultSystemSettings()
 	bytes, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
@@ -97,35 +126,6 @@ func writeDefaultSystemSettings(path string) error {
 		return err
 	}
 	return os.WriteFile(path, append(bytes, '\n'), 0o644)
-}
-
-func initialSystemSettings() (SystemSettings, error) {
-	settings := defaultSystemSettings()
-	legacyPath, err := legacyAudioSettingsPath()
-	if err != nil {
-		return settings, nil
-	}
-	bytes, err := os.ReadFile(legacyPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return settings, nil
-		}
-		return SystemSettings{}, err
-	}
-	var audioSettings AudioSettings
-	if err := json.Unmarshal(bytes, &audioSettings); err != nil {
-		return settings, nil
-	}
-	settings.Audio = normalizeAudioSettings(audioSettings)
-	return settings, nil
-}
-
-func legacyAudioSettingsPath() (string, error) {
-	root, err := projectRoot()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, projectDirName, legacyAudioSettingsFileName), nil
 }
 
 func loadSystemSettings() (SystemSettings, error) {
@@ -174,23 +174,6 @@ func saveSystemSettings(settings SystemSettings) error {
 		return err
 	}
 	return os.WriteFile(path, append(bytes, '\n'), 0o644)
-}
-
-func loadAudioSettings() (AudioSettings, error) {
-	settings, err := loadSystemSettings()
-	if err != nil {
-		return AudioSettings{}, err
-	}
-	return settings.Audio, nil
-}
-
-func saveAudioSettings(settings AudioSettings) error {
-	systemSettings, err := loadSystemSettings()
-	if err != nil {
-		return err
-	}
-	systemSettings.Audio = normalizeAudioSettings(settings)
-	return saveSystemSettings(systemSettings)
 }
 
 func loadThemeSettings() (ThemeSettings, error) {

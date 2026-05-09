@@ -19,8 +19,9 @@ type compileRange struct {
 }
 
 type compileTarget struct {
-	Range      *compileRange
-	OutputFile string
+	Range          *compileRange
+	OutputFile     string
+	IncludedSkills []string
 }
 
 func parseCompileArgs(args []string) (compileTarget, error) {
@@ -67,13 +68,12 @@ func runCompile(target compileTarget) error {
 	if err != nil {
 		return err
 	}
-
-	prefix, err := loadPrefix()
+	skills, err := loadSkills()
 	if err != nil {
 		return err
 	}
 
-	compiled, err := compilePrompts(prompts, target.Range, prefix)
+	compiled, err := compilePrompts(prompts, target.Range, skills, target.IncludedSkills)
 	if err != nil {
 		return err
 	}
@@ -84,9 +84,10 @@ func runCompile(target compileTarget) error {
 	return copyCompiledToClipboard(compiled)
 }
 
-func compilePrompts(prompts []Prompt, rng *compileRange, prefix string) (string, error) {
+func compilePrompts(prompts []Prompt, rng *compileRange, skills []Skill, includedSkills []string) (string, error) {
+	skillsText := renderSelectedSkills(skills, includedSkills)
 	if len(prompts) == 0 {
-		return strings.TrimSpace(prefix), nil
+		return strings.TrimSpace(skillsText), nil
 	}
 
 	start := 0
@@ -110,17 +111,17 @@ func compilePrompts(prompts []Prompt, rng *compileRange, prefix string) (string,
 	for i := start; i <= end; i++ {
 		indexes = append(indexes, i)
 	}
-	return compilePromptIndexes(prompts, indexes, prefix)
+	return compilePromptIndexes(prompts, indexes, skills, includedSkills)
 }
 
-func compilePromptIndexes(prompts []Prompt, indexes []int, prefix string) (string, error) {
+func compilePromptIndexes(prompts []Prompt, indexes []int, skills []Skill, includedSkills []string) (string, error) {
 	sorted := append([]int(nil), indexes...)
 	sort.Ints(sorted)
 
 	var b strings.Builder
-	trimmedPrefix := strings.TrimSpace(prefix)
-	if trimmedPrefix != "" {
-		b.WriteString(trimmedPrefix)
+	skillsText := strings.TrimSpace(renderSelectedSkills(skills, includedSkills))
+	if skillsText != "" {
+		b.WriteString(skillsText)
 	}
 	for _, i := range sorted {
 		if i < 0 || i >= len(prompts) {
@@ -143,46 +144,20 @@ func compilePromptIndexes(prompts []Prompt, indexes []int, prefix string) (strin
 	return b.String(), nil
 }
 
-func loadPrefix() (string, error) {
-	if err := ensureProject(); err != nil {
-		return "", err
-	}
-
-	path, err := prefixPath()
-	if err != nil {
-		return "", err
-	}
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
-			return "", err
+func renderSelectedSkills(skills []Skill, includedSkills []string) string {
+	included := skillNamesSet(includedSkills)
+	var blocks []string
+	for _, skill := range skills {
+		if !included[normalizeSkillName(skill.Name)] {
+			continue
 		}
-	} else if err != nil {
-		return "", err
-	}
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	return string(bytes), nil
-}
-
-func savePrefix(prefix string) error {
-	if err := ensureProject(); err != nil {
-		return err
-	}
-
-	path, err := prefixPath()
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
-			return err
+		body := strings.TrimSpace(skill.Body)
+		if body == "" {
+			continue
 		}
-	} else if err != nil {
-		return err
+		blocks = append(blocks, body)
 	}
-	return os.WriteFile(path, []byte(prefix), 0o644)
+	return strings.Join(blocks, "\n\n")
 }
 
 func writeCompiledFile(path string, compiled string) error {

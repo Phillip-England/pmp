@@ -21,7 +21,6 @@ import (
 	"time"
 )
 
-const pageSize = 50
 const serveAddress = "127.0.0.1:8765"
 
 type navItem struct {
@@ -30,69 +29,75 @@ type navItem struct {
 	Current bool
 }
 
-type newPromptPageData struct {
-	Nav           []navItem
-	Error         string
-	Title         string
-	Body          string
-	Saved         bool
-	AccentColor   string
-	AudioSettings AudioSettings
+type currentProjectData struct {
+	Name string
+	Path string
 }
 
-type prefixPageData struct {
-	Nav         []navItem
-	Error       string
-	Saved       bool
-	Prefix      string
-	AccentColor string
+type projectListItem struct {
+	Name       string
+	Path       string
+	LastOpened string
+	Current    bool
+}
+
+type SkillToggle struct {
+	Name     string
+	Included bool
+}
+
+type newPromptPageData struct {
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Error          string
+	Title          string
+	Body           string
+	Saved          bool
+	AccentColor    string
+}
+
+type skillsPageData struct {
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Error          string
+	Saved          bool
+	Skills         []Skill
+	NewSkillName   string
+	NewSkillBody   string
+	AccentColor    string
 }
 
 type settingsPageData struct {
-	Nav           []navItem
-	Error         string
-	Saved         bool
-	AccentColor   string
-	AudioSettings AudioSettings
+	Nav              []navItem
+	CurrentProject   currentProjectData
+	Error            string
+	Saved            bool
+	AccentColor      string
+	ProjectScanRoots string
 }
 
 type promptListPage struct {
-	Nav          []navItem
-	Prompts      []PromptView
-	Page         int
-	TotalPages   int
-	PrevPage     int
-	NextPage     int
-	TotalPrompts int
-	AccentColor  string
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Prompts        []PromptView
+	Skills         []SkillToggle
+	Copied         bool
+	TotalPrompts   int
+	AccentColor    string
+	MarkedIndex    int
+	HasMark        bool
 }
 
 type PromptView struct {
-	Index     int
-	Title     string
-	Timestamp string
-	HTMLBody  template.HTML
-	ElementID string
-	Marked    bool
-}
-
-type compilePageData struct {
-	Nav          []navItem
-	Options      []CompileOption
-	Error        string
-	Copied       bool
-	MarkedIndex  int
-	HasMark      bool
-	TotalPrompts int
-	AccentColor  string
-}
-
-type CompileOption struct {
-	Index     int
-	Title     string
-	Timestamp string
-	Checked   bool
-	Marked    bool
+	Index      int
+	Title      string
+	Timestamp  string
+	DateValue  string
+	SearchText string
+	HTMLBody   template.HTML
+	ElementID  string
+	Marked     bool
+	Checked    bool
 }
 
 type websocketHub struct {
@@ -103,6 +108,14 @@ type websocketHub struct {
 type projectSnapshot struct {
 	FileCount int
 	LatestMod int64
+}
+
+type projectsPageData struct {
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Projects       []projectListItem
+	AccentColor    string
+	Switched       bool
 }
 
 func newWebsocketHub() *websocketHub {
@@ -137,6 +150,9 @@ func runServe() error {
 	if err := ensureProject(); err != nil {
 		return err
 	}
+	if err := registerCurrentProject(); err != nil {
+		return err
+	}
 
 	listener, err := net.Listen("tcp", serveAddress)
 	if err != nil {
@@ -149,12 +165,13 @@ func runServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveHome)
 	mux.HandleFunc("/new", serveNewPrompt)
-	mux.HandleFunc("/prefix", servePrefix)
+	mux.HandleFunc("/skills", serveSkills)
 	mux.HandleFunc("/settings", serveSettings)
 	mux.HandleFunc("/prompts", servePrompts)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
+	mux.HandleFunc("/projects", serveProjects)
+	mux.HandleFunc("/projects/switch", serveProjectSwitch)
 	mux.HandleFunc("/compile", serveCompile)
-	mux.HandleFunc("/on.wav", serveOnSound)
 	mux.HandleFunc("/ws", hub.handle)
 
 	url := "http://" + listener.Addr().String()
@@ -171,8 +188,68 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/new", http.StatusSeeOther)
 }
 
-func serveOnSound(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "on.wav")
+func serveProjects(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := registerCurrentProject(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	currentProject, err := loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	projects, err := discoverProjects()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := projectsPageData{
+		Nav:            buildNav("/projects"),
+		CurrentProject: currentProject,
+		Projects:       buildProjectListItems(projects, currentProject.Path),
+		AccentColor:    themeSettings.AccentColor,
+		Switched:       r.URL.Query().Get("switched") == "1",
+	}
+	renderTemplate(w, projectsTemplate, data)
+}
+
+func serveProjectSwitch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	target := strings.TrimSpace(r.URL.Query().Get("path"))
+	if target == "" {
+		http.Error(w, "missing project path", http.StatusBadRequest)
+		return
+	}
+	target, err := filepath.Abs(target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := ensureProjectAtRoot(target); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := setProjectRootOverride(target); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := registerProject(target); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/projects?switched=1", http.StatusSeeOther)
 }
 
 func servePrompts(w http.ResponseWriter, r *http.Request) {
@@ -187,95 +264,70 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page := 1
-	if raw := r.URL.Query().Get("page"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 {
-			http.Error(w, "invalid page", http.StatusBadRequest)
-			return
-		}
-		page = n
-	}
-
-	data, err := buildPage(prompts, marks, page)
+	skills, err := loadSkills()
 	if err != nil {
-		code := http.StatusInternalServerError
-		if errors.Is(err, errPageOutOfRange) {
-			code = http.StatusNotFound
-		}
-		http.Error(w, err.Error(), code)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data, err := buildPage(prompts, marks)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	data.Nav = buildNav("/prompts")
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.Skills = buildSkillToggles(skills, nil)
 	data.TotalPrompts = len(prompts)
 	data.AccentColor = themeSettings.AccentColor
+	data.Copied = r.URL.Query().Get("copied") == "1"
+	data.MarkedIndex, data.HasMark = currentMarkedIndex(marks)
 
 	renderTemplate(w, promptsTemplate, data)
 }
 
 func serveCompile(w http.ResponseWriter, r *http.Request) {
-	prompts, marks, err := loadPromptState()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if r.Method == http.MethodGet {
+		http.Redirect(w, r, "/prompts", http.StatusSeeOther)
 		return
 	}
-
-	data := compilePageData{
-		Nav:          buildNav("/compile"),
-		Options:      buildCompileOptions(prompts, marks, nil),
-		TotalPrompts: len(prompts),
-	}
-	themeSettings, err := loadThemeSettings()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	data.AccentColor = themeSettings.AccentColor
-	data.MarkedIndex, data.HasMark = currentMarkedIndex(marks)
-	if r.URL.Query().Get("copied") == "1" {
-		data.Copied = true
-	}
-
-	if r.Method == http.MethodPost {
-		if err := r.ParseForm(); err != nil {
-			writeCompileJSON(w, "", err)
-			return
-		}
-
-		selected, err := parseSelectedPromptIndexes(r.Form["prompt"], len(prompts))
-		data.Options = buildCompileOptions(prompts, marks, selected)
-		if err != nil {
-			writeCompileJSON(w, "", err)
-			return
-		} else {
-			prefix, err := loadPrefix()
-			if err != nil {
-				writeCompileJSON(w, "", err)
-				return
-			}
-			compiled, err := compilePromptIndexes(prompts, selected, prefix)
-			if err != nil {
-				writeCompileJSON(w, "", err)
-				return
-			} else {
-				if err := markCompiledPrompt(selected); err != nil {
-					writeCompileJSON(w, "", err)
-					return
-				} else {
-					marks = map[int]bool{selected[len(selected)-1]: true}
-					data.Options = buildCompileOptions(prompts, marks, selected)
-					data.Copied = true
-					writeCompileJSON(w, compiled, nil)
-					return
-				}
-			}
-		}
-	} else if r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	renderTemplate(w, compileTemplate, data)
+	prompts, _, err := loadPromptState()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	skills, err := loadSkills()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	selected, err := parseSelectedPromptIndexes(r.Form["prompt"], len(prompts))
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	includedSkills := r.Form["include_skill"]
+	compiled, err := compilePromptIndexes(prompts, selected, skills, includedSkills)
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	if err := markCompiledPrompt(selected); err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	writeCompileJSON(w, compiled, nil)
 }
 
 func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
@@ -285,9 +337,13 @@ func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := newPromptPageData{
-		Nav:           buildNav("/new"),
-		AccentColor:   systemSettings.Theme.AccentColor,
-		AudioSettings: systemSettings.Audio,
+		Nav:         buildNav("/new"),
+		AccentColor: systemSettings.Theme.AccentColor,
+	}
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
@@ -331,9 +387,14 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := settingsPageData{
-		Nav:           buildNav("/settings"),
-		AccentColor:   systemSettings.Theme.AccentColor,
-		AudioSettings: systemSettings.Audio,
+		Nav:              buildNav("/settings"),
+		AccentColor:      systemSettings.Theme.AccentColor,
+		ProjectScanRoots: strings.Join(systemSettings.Projects.ScanRoots, "\n"),
+	}
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
@@ -349,15 +410,14 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 			renderTemplate(w, settingsTemplate, data)
 			return
 		}
-		systemSettings.Audio = normalizeAudioSettings(AudioSettings{
-			SplitWord: r.Form.Get("split_word"),
-			SaveWord:  r.Form.Get("save_word"),
-		})
 		systemSettings.Theme = normalizeThemeSettings(ThemeSettings{
 			AccentColor: r.Form.Get("accent_color"),
 		})
-		data.AudioSettings = systemSettings.Audio
+		systemSettings.Projects = normalizeProjectSettings(ProjectSettings{
+			ScanRoots: strings.Split(r.Form.Get("project_scan_roots"), "\n"),
+		})
 		data.AccentColor = systemSettings.Theme.AccentColor
+		data.ProjectScanRoots = strings.Join(systemSettings.Projects.ScanRoots, "\n")
 		if err := saveSystemSettings(systemSettings); err != nil {
 			data.Error = err.Error()
 			renderTemplate(w, settingsTemplate, data)
@@ -371,44 +431,65 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func servePrefix(w http.ResponseWriter, r *http.Request) {
+func serveSkills(w http.ResponseWriter, r *http.Request) {
 	themeSettings, err := loadThemeSettings()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	data := prefixPageData{
-		Nav:         buildNav("/prefix"),
+	skills, err := loadSkills()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := skillsPageData{
+		Nav:         buildNav("/skills"),
 		AccentColor: themeSettings.AccentColor,
+		Skills:      skills,
+	}
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
 	}
 
-	prefix, err := loadPrefix()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	data.Prefix = prefix
-
 	switch r.Method {
 	case http.MethodGet:
-		renderTemplate(w, prefixTemplate, data)
+		renderTemplate(w, skillsTemplate, data)
 		return
 	case http.MethodPost:
 		if err := r.ParseForm(); err != nil {
 			data.Error = err.Error()
-			renderTemplate(w, prefixTemplate, data)
+			renderTemplate(w, skillsTemplate, data)
 			return
 		}
-		data.Prefix = r.Form.Get("prefix")
-		if err := savePrefix(data.Prefix); err != nil {
-			data.Error = err.Error()
-			renderTemplate(w, prefixTemplate, data)
+		action := r.Form.Get("action")
+		switch action {
+		case "save":
+			name := r.Form.Get("skill_name")
+			body := r.Form.Get("skill_body")
+			if err := saveSkill(name, body); err != nil {
+				data.Error = err.Error()
+				data.NewSkillName = name
+				data.NewSkillBody = body
+				renderTemplate(w, skillsTemplate, data)
+				return
+			}
+		case "delete":
+			if err := deleteSkill(r.Form.Get("skill_name")); err != nil {
+				data.Error = err.Error()
+				renderTemplate(w, skillsTemplate, data)
+				return
+			}
+		default:
+			data.Error = "invalid skills action"
+			renderTemplate(w, skillsTemplate, data)
 			return
 		}
-		http.Redirect(w, r, "/prefix?saved=1", http.StatusSeeOther)
+		http.Redirect(w, r, "/skills?saved=1", http.StatusSeeOther)
 		return
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -473,11 +554,54 @@ func markCompiledPrompt(selected []int) error {
 func buildNav(current string) []navItem {
 	return []navItem{
 		{Label: "New", Href: "/new", Current: current == "/new"},
+		{Label: "Projects", Href: "/projects", Current: current == "/projects"},
 		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
-		{Label: "Prefix", Href: "/prefix", Current: current == "/prefix"},
+		{Label: "Skills", Href: "/skills", Current: current == "/skills"},
 		{Label: "Prompts", Href: "/prompts", Current: current == "/prompts"},
-		{Label: "Compile", Href: "/compile", Current: current == "/compile"},
 	}
+}
+
+func loadCurrentProjectData() (currentProjectData, error) {
+	root, err := projectRoot()
+	if err != nil {
+		return currentProjectData{}, err
+	}
+	return currentProjectData{
+		Name: projectName(root),
+		Path: root,
+	}, nil
+}
+
+func buildProjectListItems(projects []registeredProject, currentPath string) []projectListItem {
+	items := make([]projectListItem, 0, len(projects))
+	currentPath = filepath.Clean(currentPath)
+	for _, project := range projects {
+		item := projectListItem{
+			Name:    project.Name,
+			Path:    project.Path,
+			Current: filepath.Clean(project.Path) == currentPath,
+		}
+		if !project.LastOpened.IsZero() {
+			item.LastOpened = project.LastOpened.Local().Format("2006-01-02 15:04:05 MST")
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Current != items[j].Current {
+			return items[i].Current
+		}
+		if items[i].LastOpened == items[j].LastOpened {
+			return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+		}
+		if items[i].LastOpened == "" {
+			return false
+		}
+		if items[j].LastOpened == "" {
+			return true
+		}
+		return items[i].LastOpened > items[j].LastOpened
+	})
+	return items
 }
 
 func renderTemplate(w http.ResponseWriter, tpl *template.Template, data any) {
@@ -499,72 +623,39 @@ func writeCompileJSON(w http.ResponseWriter, compiled string, err error) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-var errPageOutOfRange = errors.New("page out of range")
-
-func buildPage(prompts []Prompt, marks map[int]bool, page int) (promptListPage, error) {
-	totalPages := 1
-	if len(prompts) > 0 {
-		totalPages = (len(prompts) + pageSize - 1) / pageSize
-	}
-	if page > totalPages {
-		return promptListPage{}, errPageOutOfRange
-	}
-
-	startOffset := (page - 1) * pageSize
-	endOffset := startOffset + pageSize
-	if startOffset > len(prompts) {
-		startOffset = len(prompts)
-	}
-	if endOffset > len(prompts) {
-		endOffset = len(prompts)
-	}
-
-	views := make([]PromptView, 0, endOffset-startOffset)
-	for offset := startOffset; offset < endOffset; offset++ {
-		index := len(prompts) - 1 - offset
+func buildPage(prompts []Prompt, marks map[int]bool) (promptListPage, error) {
+	views := make([]PromptView, 0, len(prompts))
+	for index := len(prompts) - 1; index >= 0; index-- {
 		prompt := prompts[index]
 		views = append(views, PromptView{
-			Index:     index,
-			Title:     prompt.Title,
-			Timestamp: prompt.Timestamp.Local().Format("2006-01-02 15:04:05 MST"),
-			HTMLBody:  template.HTML(renderMarkdown(prompt.Markdown)),
-			ElementID: fmt.Sprintf("prompt-%d", index),
-			Marked:    marks[index],
+			Index:      index,
+			Title:      prompt.Title,
+			Timestamp:  prompt.Timestamp.Local().Format("2006-01-02 15:04:05 MST"),
+			DateValue:  prompt.Timestamp.Local().Format("2006-01-02"),
+			SearchText: strings.ToLower(prompt.Title + "\n" + prompt.Markdown),
+			HTMLBody:   template.HTML(renderMarkdown(prompt.Markdown)),
+			ElementID:  fmt.Sprintf("prompt-%d", index),
+			Marked:     marks[index],
+			Checked:    false,
 		})
 	}
 
 	data := promptListPage{
-		Prompts:    views,
-		Page:       page,
-		TotalPages: totalPages,
-	}
-	if page > 1 {
-		data.PrevPage = page - 1
-	}
-	if page < totalPages {
-		data.NextPage = page + 1
+		Prompts: views,
 	}
 	return data, nil
 }
 
-func buildCompileOptions(prompts []Prompt, marks map[int]bool, selected []int) []CompileOption {
-	selectedSet := map[int]bool{}
-	for _, index := range selected {
-		selectedSet[index] = true
-	}
-
-	options := make([]CompileOption, 0, len(prompts))
-	for i := len(prompts) - 1; i >= 0; i-- {
-		prompt := prompts[i]
-		options = append(options, CompileOption{
-			Index:     i,
-			Title:     prompt.Title,
-			Timestamp: prompt.Timestamp.Local().Format("2006-01-02 15:04:05 MST"),
-			Checked:   selectedSet[i],
-			Marked:    marks[i],
+func buildSkillToggles(skills []Skill, included []string) []SkillToggle {
+	includedSet := skillNamesSet(included)
+	toggles := make([]SkillToggle, 0, len(skills))
+	for _, skill := range skills {
+		toggles = append(toggles, SkillToggle{
+			Name:     skill.Name,
+			Included: includedSet[normalizeSkillName(skill.Name)],
 		})
 	}
-	return options
+	return toggles
 }
 
 func indexesForwardFromMark(promptCount int, marks map[int]bool) []int {
@@ -867,9 +958,12 @@ const baseStyles = `
   body {
     margin: 0;
     min-height: 100vh;
-    background: #000000;
+    background:
+      radial-gradient(circle at top, rgba(143, 209, 138, 0.12), transparent 28rem),
+      linear-gradient(180deg, #050505 0%, #000000 100%);
     color: var(--text);
-    font: 14px/1.45 Georgia, "Times New Roman", serif;
+    font: 14px/1.45 "Symbols Nerd Font Mono", "SauceCodePro Nerd Font Mono", "CaskaydiaMono Nerd Font", "JetBrainsMono Nerd Font", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    letter-spacing: 0.01em;
   }
   a {
     color: var(--text);
@@ -882,9 +976,31 @@ const baseStyles = `
   }
   .nav {
     display: flex;
+    align-items: center;
+    justify-content: space-between;
     gap: 0.5rem;
     flex-wrap: wrap;
     margin-bottom: 0.75rem;
+    text-transform: uppercase;
+  }
+  .nav-links {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .nav-brand {
+    margin-right: 0.35rem;
+    padding: 0.1rem 0.15rem;
+    color: var(--action);
+    font-family: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 1.3rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    line-height: 1;
+    text-transform: lowercase;
+    text-shadow: 0 0 1.4rem color-mix(in srgb, var(--action) 32%, transparent);
   }
   .nav a, .button, button {
     border: 1px solid var(--border);
@@ -917,6 +1033,7 @@ const baseStyles = `
   }
   .panel {
     padding: 0.8rem 0.9rem;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.02), 0 1rem 2.5rem rgba(0, 0, 0, 0.22);
   }
   .panel + .panel, .stack, .pager {
     margin-top: 0.75rem;
@@ -926,6 +1043,17 @@ const baseStyles = `
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
+  }
+  .project-strip {
+    margin-bottom: 0.75rem;
+    align-items: flex-start;
+  }
+  .project-name {
+    font-size: 1rem;
+    text-transform: uppercase;
+  }
+  .project-path {
+    word-break: break-word;
   }
   .muted {
     color: var(--muted);
@@ -956,8 +1084,43 @@ const baseStyles = `
     display: grid;
     gap: 0.55rem;
   }
+  .filter-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.7fr) repeat(2, minmax(10rem, 1fr)) auto;
+    gap: 0.7rem;
+    align-items: end;
+  }
+  .prompt-filters {
+    padding: 1rem 1.1rem 1.05rem;
+  }
+  .prompt-filters .filter-grid {
+    gap: 0.95rem;
+  }
+  .prompt-filters .actions {
+    align-self: end;
+    padding-bottom: 0.05rem;
+  }
+  .prompt-filters .small {
+    display: block;
+    margin-top: 0.8rem;
+  }
+  .prompt-filters input[type="search"],
+  .prompt-filters input[type="date"] {
+    padding: 0.8rem 0.9rem;
+  }
+  .prompt-grid, .prompt-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    align-items: flex-start;
+  }
   details {
     padding: 0.7rem 0.85rem;
+    flex: 0 1 19rem;
+    min-width: 16rem;
+  }
+  details[open] {
+    flex-basis: 100%;
   }
   details.marked, .prompt-option.marked {
     border-color: var(--mark-border);
@@ -971,17 +1134,15 @@ const baseStyles = `
     display: none;
   }
   .summary-row {
-    display: flex;
-    justify-content: space-between;
-    gap: 0.75rem;
-    align-items: baseline;
+    display: grid;
+    gap: 0.2rem;
   }
   .summary-title {
     font-size: 0.98rem;
   }
   .summary-meta, .small {
     color: var(--muted);
-    font-size: 0.88rem;
+    font-size: 0.76rem;
   }
   .mark-badge {
     display: inline-block;
@@ -1006,14 +1167,9 @@ const baseStyles = `
     justify-content: space-between;
     gap: 0.5rem;
   }
-  .prompt-picker {
-    display: grid;
-    gap: 0.45rem;
-  }
   .prompt-option {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 0.65rem;
+    display: flex;
+    gap: 0.55rem;
     align-items: start;
     padding: 0.6rem 0.7rem;
     border: 1px solid var(--border);
@@ -1021,6 +1177,8 @@ const baseStyles = `
     background: #050505;
     cursor: pointer;
     transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+    flex: 0 1 18rem;
+    min-width: 15rem;
   }
   .prompt-option:hover {
     border-color: var(--action);
@@ -1031,10 +1189,19 @@ const baseStyles = `
     margin-top: 0.15rem;
   }
   .error {
-    color: #ffffff;
-    border-color: #ffffff;
+    color: #ffb8b8;
+    border-color: #7a2f2f;
+    background: #160909;
   }
-  textarea, input[type="text"], select {
+  .success {
+    color: #d6ffd3;
+    border-color: var(--action);
+    background: #091309;
+  }
+  [hidden] {
+    display: none !important;
+  }
+  textarea, input[type="text"], input[type="search"], input[type="date"], input[type="color"], select {
     width: 100%;
     border: 1px solid var(--border);
     background: #050505;
@@ -1046,6 +1213,10 @@ const baseStyles = `
   textarea {
     min-height: 18rem;
     resize: vertical;
+  }
+  input[type="color"] {
+    min-height: 3rem;
+    padding: 0.3rem;
   }
   .form-grid {
     display: grid;
@@ -1087,9 +1258,6 @@ const baseStyles = `
   .dot.heard {
     transform: scale(1.18);
   }
-  .mic-status {
-    min-height: 1.2rem;
-  }
   .instructions {
     color: var(--muted);
     font-size: 0.88rem;
@@ -1104,6 +1272,118 @@ const baseStyles = `
     justify-content: flex-end;
     margin-top: 0.7rem;
   }
+  .project-list {
+    display: grid;
+    gap: 0.75rem;
+  }
+  .project-card {
+    display: grid;
+    gap: 0.7rem;
+  }
+  .project-meta {
+    display: grid;
+    gap: 0.2rem;
+  }
+  .skill-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .skill-card {
+    display: grid;
+    gap: 0.7rem;
+    padding: 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: 0.8rem;
+    background: var(--panel);
+    flex: 0 1 16rem;
+    min-width: 13rem;
+  }
+  .skill-card-title {
+    font-weight: 600;
+    word-break: break-word;
+  }
+  .prompt-option-copy {
+    display: grid;
+    gap: 0.18rem;
+  }
+  .prompt-card {
+    display: grid;
+    gap: 0.7rem;
+    padding: 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: 0.8rem;
+    background: var(--panel);
+    flex: 0 1 18rem;
+    min-width: 15rem;
+  }
+  .prompt-card.marked {
+    border-color: var(--mark-border);
+    background: var(--mark-bg);
+  }
+  .prompt-card-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+  }
+  .prompt-card-copy {
+    display: grid;
+    gap: 0.18rem;
+  }
+  .skill-toggles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+  }
+  .skill-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: #050505;
+  }
+  dialog.prompt-modal {
+    width: min(56rem, calc(100% - 1.5rem));
+    border: 1px solid var(--border);
+    border-radius: 0.9rem;
+    background: var(--panel);
+    color: var(--text);
+    padding: 0;
+  }
+  dialog.prompt-modal::backdrop {
+    background: rgba(0, 0, 0, 0.65);
+  }
+  .modal-shell {
+    padding: 0.9rem 1rem 1rem;
+  }
+  .modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.8rem;
+    margin-bottom: 0.8rem;
+  }
+  .modal-body {
+    max-height: 70vh;
+    overflow: auto;
+    padding-top: 0.8rem;
+    border-top: 1px solid var(--border);
+  }
+  mark.search-hit {
+    background: #f3dd77;
+    color: #111111;
+    padding: 0 0.15rem;
+    border-radius: 0.2rem;
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-top: 0.9rem;
+    flex-wrap: wrap;
+  }
   .danger {
     border-color: #7a2f2f;
     color: #ffb8b8;
@@ -1117,9 +1397,24 @@ const baseStyles = `
   }
   @media (max-width: 640px) {
     body { font-size: 13px; }
-    .summary-row, .compact, .pager {
+    .compact {
       flex-direction: column;
       align-items: flex-start;
+    }
+    .nav {
+      align-items: flex-start;
+    }
+    .nav-links {
+      width: 100%;
+      justify-content: flex-start;
+      margin-left: 0;
+    }
+    .filter-grid {
+      grid-template-columns: 1fr;
+    }
+    details, .prompt-option, .prompt-card, .skill-card {
+      min-width: 100%;
+      flex-basis: 100%;
     }
   }
 `
@@ -1134,7 +1429,41 @@ const liveReloadScript = `<script>
       }
     };
   })();
+  (function() {
+    document.addEventListener('keydown', function(event) {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      var target = event.target;
+      if (target && (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.tagName === 'SELECT' ||
+        target.tagName === 'BUTTON' ||
+        target.isContentEditable
+      )) {
+        return;
+      }
+      if (!/^[1-9]$/.test(event.key)) {
+        return;
+      }
+      var links = Array.prototype.slice.call(document.querySelectorAll('.nav a'));
+      var index = parseInt(event.key, 10) - 1;
+      if (!links[index]) {
+        return;
+      }
+      event.preventDefault();
+      links[index].click();
+    });
+  })();
 </script>`
+
+const currentProjectBanner = `
+    <section class="panel project-strip">
+      <div class="small">Working directory: <span class="project-name">{{.CurrentProject.Name}}</span></div>
+    </section>`
+
+const navBrand = `<div class="nav-brand">pmp</div>`
 
 var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
 <html lang="en">
@@ -1148,14 +1477,15 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
 <body>
   <main class="shell">
     <nav class="nav">
-      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
     </nav>
     <section class="panel compact">
       <div>{{.TotalPrompts}} prompts{{if .HasMark}} <span class="muted">marked: {{.MarkedIndex}}</span>{{end}}</div>
       <div class="actions">
         <a class="button" href="/new">New</a>
         <a class="button" href="/prompts">Browse</a>
-        <a class="button primary" href="/compile">Compile</a>
+        <a class="button primary" href="/prompts">Prompts</a>
       </div>
     </section>
   </main>
@@ -1175,603 +1505,136 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
 <body>
   <main class="shell">
     <nav class="nav">
-      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
     </nav>
+  ` + currentProjectBanner + `
     {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
-    {{if .Saved}}<section class="panel">saved</section>{{end}}
+    {{if .Saved}}<section class="panel success">saved</section>{{end}}
     <section class="panel">
       <form method="post" class="form-grid">
-        <div class="actions spaced">
-          <button type="button" class="icon-button" onclick="startMic()">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a1 1 0 0 1 2 0 7 7 0 0 1-6 6.93V21h3a1 1 0 0 1 0 2H8a1 1 0 0 1 0-2h3v-2.07A7 7 0 0 1 5 12a1 1 0 0 1 2 0 5 5 0 0 0 10 0z"/></svg>
-            <span>Mic</span>
-          </button>
-          <button type="button" class="icon-button" onclick="pauseMic()">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5a1 1 0 0 1 1 1v12a1 1 0 1 1-2 0V6a1 1 0 0 1 1-1zm10 0a1 1 0 0 1 1 1v12a1 1 0 1 1-2 0V6a1 1 0 0 1 1-1z"/></svg>
-            <span>Pause</span>
-          </button>
-          <button type="button" class="icon-button" onclick="clearTranscript()">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h4a1 1 0 1 1 0 2h-1l-1 12a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7H4a1 1 0 1 1 0-2h4l1-2zm1.2 4L8 19h8L13.8 7h-3.6z"/></svg>
-            <span>Clear text</span>
-          </button>
-        </div>
-        <div class="compact">
-          <div class="stack">
-            <div id="mic-status" class="muted mic-status"></div>
-            <div id="speech-debug" class="instructions" aria-live="polite"></div>
-          </div>
-          <span id="mic-live-dot" class="dot" aria-hidden="true"></span>
-        </div>
         <label class="label">
-          <span class="label-row"><span>Title</span><span id="title-dot" class="dot" aria-hidden="true"></span></span>
-          <input id="prompt-title" type="text" name="title" value="{{.Title}}">
+          <span>Title</span>
+          <input type="text" name="title" value="{{.Title}}">
         </label>
         <label class="label">
-          <span class="label-row"><span>Body</span><span id="body-dot" class="dot" aria-hidden="true"></span></span>
-          <textarea id="prompt-body" name="body">{{.Body}}</textarea>
+          <span>Body</span>
+          <textarea name="body">{{.Body}}</textarea>
         </label>
         <div class="actions spaced">
           <button type="submit" class="primary">Save prompt</button>
         </div>
-        <div class="instructions">
-          Click the mic to start title dictation.<br>
-          Say {{.AudioSettings.SplitWord}} to switch. Say {{.AudioSettings.SaveWord}} to save.
-        </div>
       </form>
     </section>
   </main>
-  <script>
-    var recognition = null;
-    var recognitionStarting = false;
-    var recognitionActive = false;
-    var shouldKeepListening = false;
-    var micStream = null;
-    var micPermissionDenied = false;
-    var isSubmitting = false;
-    var currentField = 'title';
-    var finalTranscript = '';
-    var draftTranscript = '';
-    var micStatus = document.getElementById('mic-status');
-    var speechDebug = document.getElementById('speech-debug');
-    var micLiveDot = document.getElementById('mic-live-dot');
-    var titleDot = document.getElementById('title-dot');
-    var bodyDot = document.getElementById('body-dot');
-    var titleInput = document.getElementById('prompt-title');
-    var bodyInput = document.getElementById('prompt-body');
-    var audioSettings = {
-      splitWord: {{printf "%q" .AudioSettings.SplitWord}},
-      saveWord: {{printf "%q" .AudioSettings.SaveWord}}
-    };
-    function playMicOnSound() {
-      try {
-        var audio = new Audio('/on.wav');
-        audio.play();
-      } catch (err) {
-      }
-    }
-    function playTransitionClickSound() {
-      var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextCtor) {
-        return;
-      }
-      try {
-        var ctx = new AudioContextCtor();
-        var osc = ctx.createOscillator();
-        var gain = ctx.createGain();
-        osc.type = 'square';
-        osc.frequency.value = 1320;
-        gain.gain.value = 0.025;
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.05);
-        osc.stop(ctx.currentTime + 0.05);
-        osc.onended = function() {
-          ctx.close();
-        };
-      } catch (err) {
-      }
-    }
-    function setActiveField(field) {
-      titleDot.classList.toggle('active', field === 'title');
-      bodyDot.classList.toggle('active', field === 'body');
-    }
-    function setMicLive(state) {
-      micLiveDot.classList.toggle('waiting', state === 'waiting');
-      micLiveDot.classList.toggle('live', state === 'live');
-    }
-    function pulseHeard(dot) {
-      dot.classList.add('heard');
-      window.setTimeout(function() {
-        dot.classList.remove('heard');
-      }, 180);
-    }
-    function escapeRegExp(text) {
-      return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    }
-    function spokenSplitToken() {
-      return ' ' + audioSettings.splitWord + ' ';
-    }
-    function normalizeSpokenText(text) {
-      return text
-        .replace(/\s[-–—:]\s/g, spokenSplitToken())
-        .replace(/[.,!?;()[\]{}"']/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
-    function commandPattern() {
-      var commands = [
-        normalizeSpokenText(audioSettings.splitWord),
-        normalizeSpokenText(audioSettings.saveWord)
-      ].map(function(command) {
-        return escapeRegExp(command).replace(/\\ /g, '\\s+');
-      });
-      return new RegExp('(^|\\s)(' + commands.join('|') + ')(?=\\s|$)', 'ig');
-    }
-    function renderPromptFields(title, body, field) {
-      titleInput.value = title;
-      bodyInput.value = body;
-      setActiveField(field);
-    }
-    function updateMicStatus() {
-      if (!recognitionActive) {
-        micStatus.textContent = shouldKeepListening ? 'connecting microphone' : 'paused';
-        return;
-      }
-      micStatus.textContent = currentField === 'body' ? 'capturing body' : 'capturing title';
-    }
-    function setSpeechDebug(message) {
-      speechDebug.textContent = message || '';
-    }
-    function renderIdleState() {
-      setMicLive(recognitionActive ? 'waiting' : '');
-      renderPromptFields(titleInput.value, bodyInput.value, '');
-      updateMicStatus();
-      setSpeechDebug('click mic to start');
-    }
-    function renderCaptureState() {
-      setMicLive('live');
-      renderPromptFields(titleInput.value, bodyInput.value, currentField);
-      updateMicStatus();
-      setSpeechDebug(currentField === 'body' ? 'capturing body' : 'capturing title');
-    }
-    function parseTranscript(text, startingField) {
-      var normalized = normalizeSpokenText(text);
-      var parsed = {
-        title: '',
-        body: '',
-        field: startingField,
-        save: false
-      };
-      if (!normalized) {
-        return parsed;
-      }
-      var field = startingField;
-      var pattern = commandPattern();
-      var lastIndex = 0;
-      var match;
-      while ((match = pattern.exec(normalized)) !== null) {
-        var commandIndex = match.index + match[1].length;
-        var spoken = normalizeSpokenText(normalized.slice(lastIndex, commandIndex));
-        if (spoken) {
-          parsed[field] = [parsed[field], spoken].join(' ').trim();
-        }
-        var command = normalizeSpokenText(match[2]).toLowerCase();
-        lastIndex = commandIndex + match[2].length;
-        if (command === normalizeSpokenText(audioSettings.splitWord).toLowerCase()) {
-          field = 'body';
-          parsed.field = 'body';
-          continue;
-        }
-        if (command === normalizeSpokenText(audioSettings.saveWord).toLowerCase()) {
-          parsed.save = true;
-          break;
-        }
-      }
-      var tail = normalizeSpokenText(normalized.slice(lastIndex));
-      if (tail) {
-        parsed[field] = [parsed[field], tail].join(' ').trim();
-      }
-      parsed.field = field;
-      return parsed;
-    }
-    function updateFieldsFromTranscript() {
-      var previousField = currentField;
-      var parsed = parseTranscript((finalTranscript + ' ' + draftTranscript).replace(/\s+/g, ' ').trim(), 'title');
-      currentField = parsed.field;
-      if (previousField === 'title' && currentField === 'body') {
-        playTransitionClickSound();
-      }
-      renderPromptFields(parsed.title, parsed.body, currentField);
-      return parsed;
-    }
-    function resetCaptureState() {
-      currentField = 'title';
-      finalTranscript = '';
-      draftTranscript = '';
-      titleInput.value = '';
-      bodyInput.value = '';
-      renderIdleState();
-    }
-    function submitPromptFromAudio() {
-      if (isSubmitting) {
-        return;
-      }
-      isSubmitting = true;
-      pauseMic();
-      document.querySelector('form.form-grid').requestSubmit();
-    }
-    function ensureMicStream() {
-      if (micStream) {
-        return Promise.resolve(micStream);
-      }
-      if (micPermissionDenied || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        return Promise.resolve(null);
-      }
-      return navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
-        micStream = stream;
-        return stream;
-      }).catch(function() {
-        micPermissionDenied = true;
-        recognitionStarting = false;
-        recognitionActive = false;
-        shouldKeepListening = false;
-        micStatus.textContent = 'microphone unavailable';
-        setMicLive('');
-        setActiveField('');
-        return null;
-      });
-    }
-    function releaseMicStream() {
-      if (!micStream) {
-        return;
-      }
-      micStream.getTracks().forEach(function(track) {
-        track.stop();
-      });
-      micStream = null;
-    }
-    function ensureRecognition() {
-      if (recognition) {
-        return recognition;
-      }
-      var API = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!API) {
-        micStatus.textContent = 'speech input unavailable';
-        return null;
-      }
-      recognition = new API();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-      recognition.maxAlternatives = 5;
-      recognition.onstart = function() {
-        recognitionStarting = false;
-        recognitionActive = true;
-        isSubmitting = false;
-        updateFieldsFromTranscript();
-        renderCaptureState();
-        playMicOnSound();
-      };
-      recognition.onend = function() {
-        recognitionStarting = false;
-        recognitionActive = false;
-        if (shouldKeepListening && !isSubmitting) {
-          window.setTimeout(function() {
-            startMic(true);
-          }, 150);
-          return;
-        }
-        releaseMicStream();
-        setMicLive('');
-        setActiveField('');
-        updateMicStatus();
-      };
-      recognition.onresult = function(event) {
-        var finalParts = [];
-        var interimParts = [];
-        for (var i = 0; i < event.results.length; i++) {
-          var transcript = normalizeSpokenText(event.results[i][0].transcript);
-          if (!transcript) {
-            continue;
-          }
-          if (event.results[i].isFinal) {
-            finalParts.push(transcript);
-          } else {
-            interimParts.push(transcript);
-          }
-        }
-        if (!finalParts.length && !interimParts.length) {
-          return;
-        }
-        pulseHeard(micLiveDot);
-        finalTranscript = finalParts.join(' ').trim();
-        draftTranscript = interimParts.join(' ').trim();
-        var parsed = updateFieldsFromTranscript();
-        if (draftTranscript) {
-          setSpeechDebug('hearing: "' + draftTranscript + '"');
-        } else {
-          setSpeechDebug('captured: "' + finalTranscript + '"');
-        }
-        if (currentField === 'body') {
-          pulseHeard(bodyDot);
-        } else {
-          pulseHeard(titleDot);
-        }
-        if (parsed.save && !draftTranscript) {
-          submitPromptFromAudio();
-          return;
-        }
-      };
-      recognition.onerror = function(event) {
-        recognitionStarting = false;
-        if (event && (event.error === 'not-allowed' || event.error === 'service-not-allowed' || event.error === 'audio-capture')) {
-          shouldKeepListening = false;
-          recognitionActive = false;
-          micPermissionDenied = true;
-          releaseMicStream();
-          micStatus.textContent = 'microphone unavailable';
-          setMicLive('');
-          setActiveField('');
-          return;
-        }
-        if (event && (event.error === 'aborted' || event.error === 'no-speech')) {
-          return;
-        }
-        micStatus.textContent = 'speech error';
-        setMicLive('');
-      };
-      return recognition;
-    }
-    function startMic(preserveText) {
-      var api = ensureRecognition();
-      if (!api || recognitionActive || recognitionStarting) {
-        return;
-      }
-      shouldKeepListening = true;
-      if (!preserveText) {
-        currentField = 'title';
-        finalTranscript = '';
-        draftTranscript = '';
-        titleInput.value = '';
-        bodyInput.value = '';
-      }
-      renderCaptureState();
-      micStatus.textContent = 'connecting microphone';
-      ensureMicStream().then(function(stream) {
-        if (!shouldKeepListening || !stream || recognitionActive || recognitionStarting) {
-          return;
-        }
-        recognitionStarting = true;
-        try {
-          api.start();
-        } catch (err) {
-          recognitionStarting = false;
-          micStatus.textContent = 'speech input busy';
-        }
-      });
-    }
-    function pauseMic() {
-      shouldKeepListening = false;
-      if (recognition && (recognitionActive || recognitionStarting)) {
-        recognition.stop();
-      } else {
-        releaseMicStream();
-      }
-      recognitionStarting = false;
-      recognitionActive = false;
-      micStatus.textContent = 'paused';
-      setMicLive('');
-      setActiveField('');
-    }
-    function clearTranscript() {
-      resetCaptureState();
-      isSubmitting = false;
-    }
-    renderIdleState();
-  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))
 
-var prefixTemplate = template.Must(template.New("prefix").Parse(`<!doctype html>
+var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pmp prefix</title>
+  <title>pmp skills</title>
   <style>` + baseStyles + `</style>
   <style>:root { --action: {{.AccentColor}}; }</style>
 </head>
 <body>
   <main class="shell">
     <nav class="nav">
-      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
     </nav>
+    ` + currentProjectBanner + `
     {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
-    {{if .Saved}}<section class="panel">saved</section>{{end}}
-    <section class="panel">
+    {{if .Saved}}<section class="panel success">saved</section>{{end}}
+    <section class="panel stack">
       <form method="post" class="form-grid">
-        <div class="actions spaced">
-          <button type="button" class="icon-button" onclick="startPrefixMic()">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a1 1 0 0 1 2 0 7 7 0 0 1-6 6.93V21h3a1 1 0 0 1 0 2H8a1 1 0 0 1 0-2h3v-2.07A7 7 0 0 1 5 12a1 1 0 0 1 2 0 5 5 0 0 0 10 0z"/></svg>
-            <span>Mic</span>
-          </button>
-          <button type="button" class="icon-button" onclick="pausePrefixMic()">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5a1 1 0 0 1 1 1v12a1 1 0 1 1-2 0V6a1 1 0 0 1 1-1zm10 0a1 1 0 0 1 1 1v12a1 1 0 1 1-2 0V6a1 1 0 0 1 1-1z"/></svg>
-            <span>Pause</span>
-          </button>
-          <button type="button" class="icon-button" onclick="clearPrefixMic()">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h4a1 1 0 1 1 0 2h-1l-1 12a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7H4a1 1 0 1 1 0-2h4l1-2zm1.2 4L8 19h8L13.8 7h-3.6z"/></svg>
-            <span>Clear text</span>
-          </button>
-        </div>
-        <div class="compact">
-          <div id="prefix-mic-status" class="muted mic-status"></div>
-          <span id="prefix-mic-live-dot" class="dot" aria-hidden="true"></span>
-        </div>
         <label class="label">
-          <span>Prefix</span>
-          <textarea id="prefix-input" name="prefix">{{.Prefix}}</textarea>
+          <span>New skill name</span>
+          <input type="text" name="skill_name" value="{{.NewSkillName}}">
         </label>
+        <label class="label">
+          <span>Skill body</span>
+          <textarea name="skill_body">{{.NewSkillBody}}</textarea>
+        </label>
+        <input type="hidden" name="action" value="save">
         <div class="actions spaced">
-          <button type="submit" class="primary">Save prefix</button>
+          <button type="submit" class="primary">Save skill</button>
         </div>
       </form>
+      {{if .Skills}}
+      <div class="skill-grid">
+        {{range .Skills}}
+        <section class="skill-card">
+          <div class="skill-card-title">{{.Name}}</div>
+          <div class="actions">
+            <button type="button" onclick="openSkillModal(this)">View skill</button>
+          </div>
+          <dialog class="prompt-modal">
+            <div class="modal-shell">
+              <div class="modal-header">
+                <div>
+                  <div class="summary-title">{{.Name}}</div>
+                  <div class="summary-meta">system-wide skill</div>
+                </div>
+                <button type="button" onclick="closeSkillModal(this)">Close</button>
+              </div>
+              <div class="modal-body">
+                <form method="post" class="form-grid">
+                  <input type="hidden" name="action" value="save">
+                  <input type="hidden" name="skill_name" value="{{.Name}}">
+                  <label class="label">
+                    <span>Body</span>
+                    <textarea name="skill_body">{{.Body}}</textarea>
+                  </label>
+                  <div class="modal-actions">
+                    <button type="submit" class="primary">Update skill</button>
+                  </div>
+                </form>
+                <form method="post" class="modal-actions">
+                  <input type="hidden" name="action" value="delete">
+                  <input type="hidden" name="skill_name" value="{{.Name}}">
+                  <button type="submit" class="danger">Delete skill</button>
+                </form>
+              </div>
+            </div>
+          </dialog>
+        </section>
+        {{end}}
+      </div>
+      {{else}}
+      <div class="muted">No skills yet.</div>
+      {{end}}
     </section>
   </main>
   <script>
-    var prefixRecognition = null;
-    var prefixRecognitionStarting = false;
-    var prefixRecognitionRunning = false;
-    var prefixMicStream = null;
-    var prefixMicPermissionDenied = false;
-    var prefixTranscript = '';
-    var prefixDraft = '';
-    var prefixShouldKeepListening = false;
-    var prefixMicStatus = document.getElementById('prefix-mic-status');
-    var prefixMicLiveDot = document.getElementById('prefix-mic-live-dot');
-    function playMicOnSound() {
-      try {
-        var audio = new Audio('/on.wav');
-        audio.play();
-      } catch (err) {
-      }
+    function closestSkillDialog(node) {
+      var card = node ? node.closest('.skill-card') : null;
+      return card ? card.querySelector('dialog') : null;
     }
-    function setPrefixMicLive(live) {
-      prefixMicLiveDot.classList.toggle('live', live);
-    }
-    function ensurePrefixMicStream() {
-      if (prefixMicStream) {
-        return Promise.resolve(prefixMicStream);
-      }
-      if (prefixMicPermissionDenied || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        return Promise.resolve(null);
-      }
-      return navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
-        prefixMicStream = stream;
-        return stream;
-      }).catch(function(err) {
-        prefixMicPermissionDenied = true;
-        prefixMicStatus.textContent = 'microphone unavailable';
-        setPrefixMicLive(false);
-        return null;
-      });
-    }
-    function releasePrefixMicStream() {
-      if (!prefixMicStream) {
+    function openSkillModal(button) {
+      var dialog = closestSkillDialog(button);
+      if (!dialog) {
         return;
       }
-      prefixMicStream.getTracks().forEach(function(track) {
-        track.stop();
-      });
-      prefixMicStream = null;
-    }
-    function updatePrefixField() {
-      document.getElementById('prefix-input').value = (prefixTranscript + ' ' + prefixDraft).replace(/\s+/g, ' ').trim();
-    }
-    function ensurePrefixRecognition() {
-      if (prefixRecognition) {
-        return prefixRecognition;
-      }
-      var API = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!API) {
-        prefixMicStatus.textContent = 'speech input unavailable';
-        return null;
-      }
-      prefixRecognition = new API();
-      prefixRecognition.continuous = true;
-      prefixRecognition.interimResults = true;
-      prefixRecognition.onresult = function(event) {
-        var finalParts = [];
-        var interimParts = [];
-        for (var i = 0; i < event.results.length; i++) {
-          var transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalParts.push(transcript);
-          } else {
-            interimParts.push(transcript);
-          }
-        }
-        prefixTranscript = finalParts.join(' ').trim();
-        prefixDraft = interimParts.join(' ').trim();
-        updatePrefixField();
-      };
-      prefixRecognition.onstart = function() {
-        prefixRecognitionStarting = false;
-        prefixRecognitionRunning = true;
-        prefixMicStatus.textContent = 'listening';
-        setPrefixMicLive(true);
-        playMicOnSound();
-      };
-      prefixRecognition.onend = function() {
-        prefixRecognitionStarting = false;
-        prefixRecognitionRunning = false;
-        if (prefixMicStatus.textContent === 'listening') {
-          prefixMicStatus.textContent = 'paused';
-        }
-        if (!prefixShouldKeepListening) {
-          releasePrefixMicStream();
-        }
-        setPrefixMicLive(false);
-      };
-      prefixRecognition.onerror = function(event) {
-        if (event && (event.error === 'not-allowed' || event.error === 'service-not-allowed')) {
-          prefixShouldKeepListening = false;
-          prefixMicPermissionDenied = true;
-          releasePrefixMicStream();
-          prefixMicStatus.textContent = 'microphone unavailable';
-          setPrefixMicLive(false);
-          return;
-        }
-        prefixMicStatus.textContent = 'speech error';
-        setPrefixMicLive(false);
-      };
-      return prefixRecognition;
-    }
-    function startPrefixMic() {
-      var api = ensurePrefixRecognition();
-      if (!api) {
-        return;
-      }
-      prefixShouldKeepListening = true;
-      if (prefixRecognitionRunning || prefixRecognitionStarting) {
-        return;
-      }
-      prefixMicStatus.textContent = 'connecting microphone';
-      ensurePrefixMicStream().then(function(stream) {
-        if (!prefixShouldKeepListening || !stream || prefixRecognitionRunning || prefixRecognitionStarting) {
-          return;
-        }
-        prefixRecognitionStarting = true;
-        try {
-          api.start();
-        } catch (err) {
-          prefixRecognitionStarting = false;
-          prefixMicStatus.textContent = 'speech input busy';
-        }
-      });
-    }
-    function pausePrefixMic() {
-      if (!prefixRecognition) {
-        prefixShouldKeepListening = false;
-        releasePrefixMicStream();
-        return;
-      }
-      prefixShouldKeepListening = false;
-      if (prefixRecognitionRunning || prefixRecognitionStarting) {
-        prefixRecognition.stop();
+      if (typeof dialog.showModal === 'function') {
+        dialog.showModal();
       } else {
-        releasePrefixMicStream();
+        dialog.setAttribute('open', 'open');
       }
-      prefixMicStatus.textContent = 'paused';
     }
-    function clearPrefixMic() {
-      prefixTranscript = '';
-      prefixDraft = '';
-      document.getElementById('prefix-input').value = '';
-      prefixMicStatus.textContent = '';
-      setPrefixMicLive(false);
+    function closeSkillModal(button) {
+      var dialog = button ? button.closest('dialog') : null;
+      if (!dialog) {
+        return;
+      }
+      if (typeof dialog.close === 'function') {
+        dialog.close();
+      } else {
+        dialog.removeAttribute('open');
+      }
     }
   </script>
   ` + liveReloadScript + `
@@ -1790,24 +1653,14 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
 <body>
   <main class="shell">
     <nav class="nav">
-      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
     </nav>
+    ` + currentProjectBanner + `
     {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
-    {{if .Saved}}<section class="panel">saved</section>{{end}}
+    {{if .Saved}}<section class="panel success">saved</section>{{end}}
     <section class="panel">
       <form method="post" class="form-grid">
-        <div class="stack">
-          <h2 class="section-title">Audio Keywords</h2>
-          <div class="instructions">These apply across every project on this machine.</div>
-        </div>
-        <label class="label">
-          <span>Split word</span>
-          <input type="text" name="split_word" value="{{.AudioSettings.SplitWord}}">
-        </label>
-        <label class="label">
-          <span>Save word</span>
-          <input type="text" name="save_word" value="{{.AudioSettings.SaveWord}}">
-        </label>
         <div class="stack">
           <h2 class="section-title">Theme</h2>
           <div class="instructions">Accent color is also system-wide.</div>
@@ -1816,12 +1669,21 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
           <span>Accent color</span>
           <input type="color" name="accent_color" value="{{.AccentColor}}">
         </label>
-        <div class="actions spaced">
-          <button type="submit" class="primary">Save settings</button>
+        <div class="stack">
+          <h2 class="section-title">Project Scan Roots</h2>
+          <div class="instructions">PMP only scans these directories for projects. Keep this list small and focused.</div>
+          <div class="instructions">Enter one absolute path per line. Projects you open directly are still kept in the local registry even if they live outside these roots.</div>
         </div>
-      </form>
-    </section>
-  </main>
+        <label class="label">
+          <span>Directories to scan</span>
+          <textarea name="project_scan_roots">{{.ProjectScanRoots}}</textarea>
+        </label>
+	        <div class="actions spaced">
+	          <button type="submit" class="primary">Save settings</button>
+	        </div>
+	      </form>
+	    </section>
+	  </main>
   <script>
     (function() {
       var input = document.querySelector('input[name="accent_color"]');
@@ -1849,115 +1711,293 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
 <body>
   <main class="shell">
     <nav class="nav">
-      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
     </nav>
+    ` + currentProjectBanner + `
     <section class="panel compact">
-      <div>{{.TotalPrompts}} prompts · page {{.Page}}/{{.TotalPages}}</div>
+      <div>{{.TotalPrompts}} prompts{{if .HasMark}} · marked {{.MarkedIndex}}{{end}}</div>
       <div class="actions">
-        <button type="button" onclick="toggleAll(true)">Open all</button>
-        <button type="button" onclick="toggleAll(false)">Close all</button>
+        <button type="button" onclick="setAll(true)">Select all</button>
+        {{if .HasMark}}<button type="button" onclick="selectFromMark()">Select from mark</button>{{end}}
+        {{if .HasMark}}<button type="button" onclick="compileFromMark()">Compile from mark</button>{{end}}
+        <button type="button" onclick="setAll(false)">Clear all</button>
       </div>
     </section>
-    <section class="stack">
-      {{range .Prompts}}
-      <details id="{{.ElementID}}" {{if .Marked}}class="marked"{{end}}>
-        <summary>
-          <div class="summary-row">
-            <span class="summary-title">[{{.Index}}] {{.Title}}{{if .Marked}}<span class="mark-badge">marked</span>{{end}}</span>
-            <span class="summary-meta">{{.Timestamp}}</span>
-          </div>
-        </summary>
-        <article>{{.HTMLBody}}</article>
-        <div class="prompt-actions">
-          <form method="post" action="/prompts/delete">
-            <input type="hidden" name="index" value="{{.Index}}">
-            <button type="submit" class="danger">Delete</button>
-          </form>
-        </div>
-      </details>
-      {{else}}
-      <section class="panel">
-        <div class="muted">No prompts.</div>
-      </section>
-      {{end}}
-    </section>
-    <div class="pager">
-      <div>{{if .PrevPage}}<a class="button" href="/prompts?page={{.PrevPage}}">Newer</a>{{end}}</div>
-      <div>{{if .NextPage}}<a class="button" href="/prompts?page={{.NextPage}}">Older</a>{{end}}</div>
-    </div>
-  </main>
-  <script>
-    function toggleAll(open) {
-      document.querySelectorAll("details").forEach(function(el) {
-        el.open = open;
-      });
-    }
-  </script>
-  ` + liveReloadScript + `
-</body>
-</html>`))
-
-var compileTemplate = template.Must(template.New("compile").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pmp compile</title>
-  <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
-</head>
-<body>
-  <main class="shell">
-    <nav class="nav">
-      {{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}
-    </nav>
-	    <section class="panel compact">
-	      <div>{{.TotalPrompts}} prompts</div>
-	      <div class="actions">
-	        <button type="button" onclick="setAll(true)">Select all</button>
-	        {{if .HasMark}}<button type="button" onclick="selectFromMark()">Select from mark</button>{{end}}
-	        {{if .HasMark}}<button type="button" onclick="compileFromMark()">Compile from mark</button>{{end}}
-	        <button type="button" onclick="setAll(false)">Clear all</button>
-	      </div>
-	    </section>
-    {{if .Error}}
-    <section class="panel error">{{.Error}}</section>
-    {{end}}
     {{if .Copied}}
-    <section class="panel">compiled to clipboard</section>
+    <section class="panel success">compiled to clipboard</section>
     {{end}}
-    <section class="panel">
-      <form id="compile-form" method="post">
-        <div class="actions spaced">
-          <button type="submit" class="primary">Compile</button>
+    <section class="panel prompt-filters">
+      <div class="filter-grid">
+        <label class="label">
+          <span>Search prompts</span>
+          <input id="prompt-search" type="search" placeholder="search title or body">
+        </label>
+        <label class="label">
+          <span>From date</span>
+          <input id="prompt-date-from" type="date">
+        </label>
+        <label class="label">
+          <span>To date</span>
+          <input id="prompt-date-to" type="date">
+        </label>
+        <div class="actions">
+          <button type="button" onclick="clearPromptFilters()">Clear filters</button>
         </div>
-        <div class="prompt-picker" {{if .HasMark}}data-marked-index="{{.MarkedIndex}}"{{end}}>
-          {{range .Options}}
-          <label class="prompt-option {{if .Marked}}marked{{end}}">
-            <input type="checkbox" name="prompt" value="{{.Index}}" data-index="{{.Index}}" {{if .Checked}}checked{{end}}>
-            <span>
-              <strong>[{{.Index}}] {{.Title}}</strong>{{if .Marked}} <span class="mark-badge">marked</span>{{end}}<br>
-              <span class="small">{{.Timestamp}}</span>
-            </span>
-          </label>
+      </div>
+      <div class="small">Showing <span id="visible-prompt-count">{{.TotalPrompts}}</span> of {{.TotalPrompts}} prompts</div>
+    </section>
+    <section class="panel stack">
+      <form id="compile-form" method="post" class="stack">
+        <div class="actions spaced">
+          <button type="submit" class="primary">Compile selected prompts</button>
+        </div>
+        <div class="prompt-grid" {{if .HasMark}}data-marked-index="{{.MarkedIndex}}"{{end}}>
+          {{range .Prompts}}
+          <section class="prompt-card {{if .Marked}}marked{{end}}" data-search="{{.SearchText}}" data-date="{{.DateValue}}">
+            <div class="prompt-card-header">
+              <input type="checkbox" name="prompt" value="{{.Index}}" data-index="{{.Index}}" {{if .Checked}}checked{{end}}>
+              <div class="prompt-card-copy">
+                <strong>{{.Title}}</strong>{{if .Marked}} <span class="mark-badge">marked</span>{{end}}
+                <span class="small">#{{.Index}} · {{.Timestamp}}</span>
+              </div>
+            </div>
+            <div class="actions">
+              <button type="button" onclick="openPromptModal('{{.ElementID}}')">View</button>
+            </div>
+            <div id="{{.ElementID}}-content" hidden>{{.HTMLBody}}</div>
+            <dialog id="{{.ElementID}}" class="prompt-modal">
+              <div class="modal-shell">
+                <div class="modal-header">
+                  <div>
+                    <div class="summary-title">{{.Title}}</div>
+                    <div class="summary-meta">#{{.Index}} · {{.Timestamp}}</div>
+                  </div>
+                  <button type="button" onclick="closePromptModal('{{.ElementID}}')">Close</button>
+                </div>
+                <div class="modal-body" id="{{.ElementID}}-body"></div>
+                <div class="prompt-actions">
+                  <form method="post" action="/prompts/delete">
+                    <input type="hidden" name="index" value="{{.Index}}">
+                    <button type="submit" class="danger">Delete</button>
+                  </form>
+                </div>
+              </div>
+            </dialog>
+          </section>
           {{else}}
-          <div class="muted">No prompts.</div>
+          <section class="panel">
+            <div class="muted">No prompts.</div>
+          </section>
           {{end}}
         </div>
       </form>
     </section>
-	  </main>
-	  <script>
-	    function pickerElement() {
-	      return document.querySelector('.prompt-picker');
-	    }
+    {{if .Skills}}
+    <dialog id="compile-skill-modal" class="prompt-modal">
+      <div class="modal-shell">
+        <div class="modal-header">
+          <div>
+            <div class="summary-title">Compile with skills</div>
+            <div class="summary-meta">Skills are opt-in. Select only the ones you want in this compilation.</div>
+          </div>
+          <button type="button" onclick="closeCompileSkillModal()">Close</button>
+        </div>
+        <div class="modal-body">
+          <div class="skill-toggles">
+            {{range .Skills}}
+            <label class="skill-toggle">
+              <input type="checkbox" name="modal_include_skill" value="{{.Name}}" {{if .Included}}checked{{end}}>
+              <span>{{.Name}}</span>
+            </label>
+            {{end}}
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="primary" onclick="confirmCompileWithSkills()">Compile now</button>
+          </div>
+        </div>
+      </div>
+    </dialog>
+    {{end}}
+  </main>
+  <script>
+    function promptGridElement() {
+      return document.querySelector('.prompt-grid');
+    }
+    var pendingCompileRequest = null;
+    function compileSkillDialog() {
+      return document.getElementById('compile-skill-modal');
+    }
+    function promptFilterElements() {
+      return {
+        search: document.getElementById('prompt-search'),
+        from: document.getElementById('prompt-date-from'),
+        to: document.getElementById('prompt-date-to'),
+        count: document.getElementById('visible-prompt-count')
+      };
+    }
+    function activePromptSearchTerm() {
+      var filters = promptFilterElements();
+      return filters.search ? filters.search.value.trim() : '';
+    }
 	    function markedIndex() {
-	      var picker = pickerElement();
+	      var picker = promptGridElement();
 	      if (!picker) {
 	        return NaN;
 	      }
 	      return parseInt(picker.getAttribute('data-marked-index'), 10);
 	    }
+    function highlightPromptSearch(container, term) {
+      if (!container || !term) {
+        return;
+      }
+      var normalizedTerm = term.toLowerCase();
+      var walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+          if (!node.nodeValue || !node.nodeValue.trim()) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          var parent = node.parentNode;
+          if (!parent || /^(SCRIPT|STYLE|MARK|TEXTAREA)$/i.test(parent.nodeName)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return node.nodeValue.toLowerCase().indexOf(normalizedTerm) === -1
+            ? NodeFilter.FILTER_REJECT
+            : NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      var matches = [];
+      while (walker.nextNode()) {
+        matches.push(walker.currentNode);
+      }
+      matches.forEach(function(node) {
+        var text = node.nodeValue;
+        var lower = text.toLowerCase();
+        var fragment = document.createDocumentFragment();
+        var start = 0;
+        while (start < text.length) {
+          var index = lower.indexOf(normalizedTerm, start);
+          if (index === -1) {
+            fragment.appendChild(document.createTextNode(text.slice(start)));
+            break;
+          }
+          if (index > start) {
+            fragment.appendChild(document.createTextNode(text.slice(start, index)));
+          }
+          var mark = document.createElement('mark');
+          mark.className = 'search-hit';
+          mark.textContent = text.slice(index, index + term.length);
+          fragment.appendChild(mark);
+          start = index + term.length;
+        }
+        node.parentNode.replaceChild(fragment, node);
+      });
+    }
+    function applyPromptFilters() {
+      var filters = promptFilterElements();
+      var searchValue = filters.search ? filters.search.value.trim().toLowerCase() : '';
+      var fromValue = filters.from ? filters.from.value : '';
+      var toValue = filters.to ? filters.to.value : '';
+      var visible = 0;
+      document.querySelectorAll('.prompt-card').forEach(function(card) {
+        var haystack = (card.getAttribute('data-search') || '').toLowerCase();
+        var dateValue = card.getAttribute('data-date') || '';
+        var matchesSearch = !searchValue || haystack.indexOf(searchValue) !== -1;
+        var matchesFrom = !fromValue || dateValue >= fromValue;
+        var matchesTo = !toValue || dateValue <= toValue;
+        var show = matchesSearch && matchesFrom && matchesTo;
+        card.hidden = !show;
+        if (show) {
+          visible += 1;
+        }
+      });
+      if (filters.count) {
+        filters.count.textContent = String(visible);
+      }
+    }
+    function clearPromptFilters() {
+      var filters = promptFilterElements();
+      if (filters.search) {
+        filters.search.value = '';
+      }
+      if (filters.from) {
+        filters.from.value = '';
+      }
+      if (filters.to) {
+        filters.to.value = '';
+      }
+      applyPromptFilters();
+    }
+      function openPromptModal(id) {
+        var dialog = document.getElementById(id);
+        var body = document.getElementById(id + '-body');
+        var content = document.getElementById(id + '-content');
+        if (!dialog || !body || !content) {
+          return;
+        }
+        body.innerHTML = content.innerHTML;
+        highlightPromptSearch(body, activePromptSearchTerm());
+        if (typeof dialog.showModal === 'function') {
+          dialog.showModal();
+        } else {
+          dialog.setAttribute('open', 'open');
+        }
+      }
+      function closePromptModal(id) {
+        var dialog = document.getElementById(id);
+        if (!dialog) {
+          return;
+        }
+        if (typeof dialog.close === 'function') {
+          dialog.close();
+        } else {
+          dialog.removeAttribute('open');
+        }
+      }
+      function openCompileSkillModal(params, emptyMessage) {
+        if (!params.has('prompt')) {
+          showCompileError(emptyMessage);
+          return;
+        }
+        var dialog = compileSkillDialog();
+        if (!dialog) {
+          submitCompile(params, emptyMessage);
+          return;
+        }
+        pendingCompileRequest = {
+          params: params,
+          emptyMessage: emptyMessage,
+        };
+        if (typeof dialog.showModal === 'function') {
+          dialog.showModal();
+        } else {
+          dialog.setAttribute('open', 'open');
+        }
+      }
+      function closeCompileSkillModal() {
+        var dialog = compileSkillDialog();
+        if (!dialog) {
+          pendingCompileRequest = null;
+          return;
+        }
+        if (typeof dialog.close === 'function') {
+          dialog.close();
+        } else {
+          dialog.removeAttribute('open');
+        }
+        pendingCompileRequest = null;
+      }
+      function confirmCompileWithSkills() {
+        var params = pendingCompileRequest ? new URLSearchParams(pendingCompileRequest.params.toString()) : new URLSearchParams();
+        var emptyMessage = pendingCompileRequest ? pendingCompileRequest.emptyMessage : 'select at least one prompt to compile';
+        document.querySelectorAll('input[name="modal_include_skill"]').forEach(function(el) {
+          if (el.checked) {
+            params.append('include_skill', el.value);
+          }
+        });
+        closeCompileSkillModal();
+        submitCompile(params, emptyMessage);
+      }
 	    function createParamsFromSelection(predicate) {
 	      var params = new URLSearchParams();
 	      document.querySelectorAll('input[name="prompt"]').forEach(function(el) {
@@ -1978,7 +2018,6 @@ var compileTemplate = template.Must(template.New("compile").Parse(`<!doctype htm
 	      error.textContent = message;
 	    }
 	    function submitCompile(params, emptyMessage) {
-	      var form = document.getElementById('compile-form');
 	      if (!params.has('prompt')) {
 	        showCompileError(emptyMessage);
 	        return;
@@ -2011,11 +2050,11 @@ var compileTemplate = template.Must(template.New("compile").Parse(`<!doctype htm
 	        }
 	        if (navigator.clipboard && navigator.clipboard.writeText) {
 	          navigator.clipboard.writeText(text).catch(fallbackCopy).finally(function() {
-	            window.location.href = '/compile?copied=1';
+	            window.location.href = '/prompts?copied=1';
 	          });
 	        } else {
 	          fallbackCopy();
-	          window.location.href = '/compile?copied=1';
+	          window.location.href = '/prompts?copied=1';
 	        }
 	      });
 	    }
@@ -2039,18 +2078,77 @@ var compileTemplate = template.Must(template.New("compile").Parse(`<!doctype htm
 	      if (Number.isNaN(mark)) {
 	        return;
 	      }
-	      submitCompile(createParamsFromSelection(function(el) {
+	      var params = createParamsFromSelection(function(el) {
 	        var index = parseInt(el.getAttribute('data-index'), 10);
 	        return !Number.isNaN(index) && index > mark;
-	      }), 'no prompts found after the marked prompt');
+	      });
+        openCompileSkillModal(params, 'no prompts found after the marked prompt');
 	    }
 	    document.getElementById('compile-form').addEventListener('submit', function(event) {
 	      event.preventDefault();
-	      submitCompile(createParamsFromSelection(function(el) {
+	      openCompileSkillModal(createParamsFromSelection(function(el) {
 	        return el.checked;
 	      }), 'select at least one prompt to compile');
 	    });
+    ['prompt-search', 'prompt-date-from', 'prompt-date-to'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (!el) {
+        return;
+      }
+      el.addEventListener('input', applyPromptFilters);
+      el.addEventListener('change', applyPromptFilters);
+    });
+    applyPromptFilters();
 	  </script>
+  ` + liveReloadScript + `
+</body>
+</html>`))
+
+var projectsTemplate = template.Must(template.New("projects").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pmp projects</title>
+  <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+    </nav>
+    ` + currentProjectBanner + `
+    {{if .Switched}}<section class="panel success">project switched</section>{{end}}
+    <section class="panel stack">
+      <div>
+        <h2 class="section-title">Projects On This Machine</h2>
+        <div class="instructions">PMP scans only your configured project roots for folders containing <code>.pmp</code> and keeps a local registry of projects you open.</div>
+        <div class="instructions">Adjust scan roots in <a href="/settings">settings</a> if you keep projects somewhere else.</div>
+      </div>
+      <div class="project-list">
+        {{range .Projects}}
+        <section class="panel project-card {{if .Current}}success{{end}}">
+          <div class="project-meta">
+            <div class="project-name">{{.Name}}{{if .Current}} <span class="mark-badge">current</span>{{end}}</div>
+            <div class="instructions project-path">{{.Path}}</div>
+            {{if .LastOpened}}<div class="small">last opened {{.LastOpened}}</div>{{end}}
+          </div>
+          <div class="actions">
+            {{if .Current}}
+            <a class="button" href="/new">Open current project</a>
+            {{else}}
+            <a class="button primary" href="/projects/switch?path={{urlquery .Path}}">Switch to project</a>
+            {{end}}
+          </div>
+        </section>
+        {{else}}
+        <div class="muted">No PMP projects found yet.</div>
+        {{end}}
+      </div>
+    </section>
+  </main>
   ` + liveReloadScript + `
 </body>
 </html>`))
