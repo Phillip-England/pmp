@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 const serveAddress = "127.0.0.1:8765"
@@ -86,6 +90,16 @@ type instructionsPageData struct {
 	Body           string
 }
 
+type terminalPageData struct {
+	Nav             []navItem
+	CurrentProject  currentProjectData
+	AccentColor     string
+	Sessions        []terminalSessionSummary
+	SessionsJSON    template.JS
+	ActiveSessionID string
+	Error           string
+}
+
 type promptListPage struct {
 	Nav            []navItem
 	CurrentProject currentProjectData
@@ -128,6 +142,47 @@ type projectSnapshot struct {
 	LatestMod int64
 }
 
+type terminalSessionSummary struct {
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	CreatedAt  string `json:"createdAt"`
+	Running    bool   `json:"running"`
+	LastActive int64  `json:"lastActive"`
+}
+
+type terminalSession struct {
+	id         string
+	title      string
+	cmd        *exec.Cmd
+	pty        *os.File
+	createdAt  time.Time
+	lastActive time.Time
+	running    bool
+	buffer     []byte
+	subs       map[*terminalSubscriber]struct{}
+	mu         sync.Mutex
+}
+
+type terminalManager struct {
+	mu       sync.Mutex
+	sessions map[string]*terminalSession
+	nextID   int
+}
+
+type terminalClientMessage struct {
+	Type string `json:"type"`
+	Data string `json:"data"`
+	Cols uint16 `json:"cols"`
+	Rows uint16 `json:"rows"`
+}
+
+type terminalSubscriber struct {
+	data chan []byte
+	done chan struct{}
+}
+
+var terminals = newTerminalManager()
+
 type projectsPageData struct {
 	Nav            []navItem
 	CurrentProject currentProjectData
@@ -143,6 +198,10 @@ type projectsPageData struct {
 
 func newWebsocketHub() *websocketHub {
 	return &websocketHub{conns: map[net.Conn]struct{}{}}
+}
+
+func newTerminalManager() *terminalManager {
+	return &terminalManager{sessions: map[string]*terminalSession{}}
 }
 
 func (h *websocketHub) add(conn net.Conn) {
@@ -191,6 +250,12 @@ func runServe() error {
 	mux.HandleFunc("/instructions", serveInstructions)
 	mux.HandleFunc("/skills", serveSkills)
 	mux.HandleFunc("/settings", serveSettings)
+	mux.Handle("/xterm.css", http.FileServer(http.FS(uiAssets)))
+	mux.Handle("/xterm.js", http.FileServer(http.FS(uiAssets)))
+	mux.Handle("/xterm-addon-fit.js", http.FileServer(http.FS(uiAssets)))
+	mux.HandleFunc("/terminal", serveTerminal)
+	mux.HandleFunc("/terminal/sessions", serveTerminalSessions)
+	mux.HandleFunc("/terminal/ws", serveTerminalWS)
 	mux.HandleFunc("/prompts", servePrompts)
 	mux.HandleFunc("/responses", serveResponses)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
@@ -373,6 +438,157 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 	data.MarkedIndex, data.HasMark = currentMarkedIndex(marks)
 
 	renderTemplate(w, promptsTemplate, data)
+}
+
+func serveTerminal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	currentProject, err := loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sessions := terminals.summaries()
+	if len(sessions) == 0 {
+		session, err := terminals.create()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		sessions = []terminalSessionSummary{session.summary()}
+	}
+	activeID := strings.TrimSpace(r.URL.Query().Get("session"))
+	if activeID == "" && len(sessions) > 0 {
+		activeID = sessions[0].ID
+	}
+	sessionsJSON, err := json.Marshal(sessions)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := terminalPageData{
+		Nav:             buildNav("/terminal"),
+		CurrentProject:  currentProject,
+		AccentColor:     themeSettings.AccentColor,
+		Sessions:        sessions,
+		SessionsJSON:    template.JS(sessionsJSON),
+		ActiveSessionID: activeID,
+	}
+	renderTemplate(w, terminalTemplate, data)
+}
+
+func serveTerminalSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, terminals.summaries(), http.StatusOK)
+	case http.MethodPost:
+		session, err := terminals.create()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, session.summary(), http.StatusCreated)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func serveTerminalWS(w http.ResponseWriter, r *http.Request) {
+	if !headerContainsToken(r.Header, "Connection", "Upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	session, ok := terminals.get(id)
+	if !ok {
+		http.Error(w, "unknown terminal session", http.StatusNotFound)
+		return
+	}
+	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if key == "" {
+		http.Error(w, "missing websocket key", http.StatusBadRequest)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "websocket unsupported", http.StatusInternalServerError)
+		return
+	}
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	accept := websocketAccept(key)
+	if _, err := rw.WriteString(
+		"HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + accept + "\r\n\r\n",
+	); err != nil {
+		_ = conn.Close()
+		return
+	}
+	if err := rw.Flush(); err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	updates := session.subscribe()
+	defer func() {
+		session.unsubscribe(updates)
+		_ = conn.Close()
+	}()
+
+	go func() {
+		if err := writeTerminalPayload(conn, "snapshot", session.snapshot()); err != nil {
+			_ = conn.Close()
+			return
+		}
+		for {
+			select {
+			case <-updates.done:
+				return
+			case chunk := <-updates.data:
+				if err := writeTerminalPayload(conn, "data", chunk); err != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		opcode, payload, err := readWebsocketFrame(conn)
+		if err != nil {
+			return
+		}
+		switch opcode {
+		case 0x8:
+			return
+		case 0x1:
+			var msg terminalClientMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				continue
+			}
+			switch msg.Type {
+			case "input":
+				data, err := base64.StdEncoding.DecodeString(msg.Data)
+				if err != nil {
+					continue
+				}
+				_, _ = session.write(data)
+			case "resize":
+				session.resize(msg.Cols, msg.Rows)
+			}
+		}
+	}
 }
 
 func serveResponses(w http.ResponseWriter, r *http.Request) {
@@ -730,6 +946,7 @@ func buildNav(current string) []navItem {
 		{Label: "Projects", Href: "/projects", Current: current == "/projects"},
 		{Label: "Instructions", Href: "/instructions", Current: current == "/instructions"},
 		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
+		{Label: "Terminal", Href: "/terminal", Current: current == "/terminal"},
 		{Label: "Skills", Href: "/skills", Current: current == "/skills"},
 		{Label: "Prompts", Href: "/prompts", Current: current == "/prompts"},
 		{Label: "Responses", Href: "/responses", Current: current == "/responses"},
@@ -795,6 +1012,12 @@ func writeCompileJSON(w http.ResponseWriter, compiled string, err error) {
 	} else {
 		payload["compiled"] = compiled
 	}
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeJSON(w http.ResponseWriter, payload any, status int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
@@ -1042,6 +1265,184 @@ func openBrowser(url string) error {
 	return cmd.Start()
 }
 
+func (m *terminalManager) summaries() []terminalSessionSummary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	summaries := make([]terminalSessionSummary, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		summaries = append(summaries, session.summary())
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].LastActive > summaries[j].LastActive
+	})
+	return summaries
+}
+
+func (m *terminalManager) get(id string) (*terminalSession, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[id]
+	return session, ok
+}
+
+func (m *terminalManager) create() (*terminalSession, error) {
+	shell, args := defaultShellCommand()
+	cmd := exec.Command(shell, args...)
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Dir, _ = projectRoot()
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	m.nextID++
+	id := fmt.Sprintf("term-%d", m.nextID)
+	session := &terminalSession{
+		id:         id,
+		title:      filepath.Base(shell),
+		cmd:        cmd,
+		pty:        ptmx,
+		createdAt:  time.Now(),
+		lastActive: time.Now(),
+		running:    true,
+		subs:       map[*terminalSubscriber]struct{}{},
+	}
+	m.sessions[id] = session
+	m.mu.Unlock()
+
+	go session.captureOutput()
+	go session.waitForExit()
+
+	return session, nil
+}
+
+func (s *terminalSession) summary() terminalSessionSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return terminalSessionSummary{
+		ID:         s.id,
+		Title:      s.title,
+		CreatedAt:  s.createdAt.Local().Format("2006-01-02 15:04:05 MST"),
+		Running:    s.running,
+		LastActive: s.lastActive.UnixNano(),
+	}
+}
+
+func (s *terminalSession) snapshot() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.buffer...)
+}
+
+func (s *terminalSession) subscribe() *terminalSubscriber {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub := &terminalSubscriber{
+		data: make(chan []byte, 128),
+		done: make(chan struct{}),
+	}
+	s.subs[sub] = struct{}{}
+	return sub
+}
+
+func (s *terminalSession) unsubscribe(sub *terminalSubscriber) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.subs[sub]; !ok {
+		return
+	}
+	delete(s.subs, sub)
+	close(sub.done)
+}
+
+func (s *terminalSession) write(data []byte) (int, error) {
+	s.mu.Lock()
+	s.lastActive = time.Now()
+	ptmx := s.pty
+	s.mu.Unlock()
+	return ptmx.Write(data)
+}
+
+func (s *terminalSession) resize(cols uint16, rows uint16) {
+	if cols == 0 || rows == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.lastActive = time.Now()
+	ptmx := s.pty
+	s.mu.Unlock()
+	_ = pty.Setsize(ptmx, &pty.Winsize{Cols: cols, Rows: rows})
+}
+
+func (s *terminalSession) captureOutput() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := s.pty.Read(buf)
+		if n > 0 {
+			chunk := append([]byte(nil), buf[:n]...)
+			s.mu.Lock()
+			s.lastActive = time.Now()
+			s.buffer = append(s.buffer, chunk...)
+			if len(s.buffer) > 256*1024 {
+				s.buffer = append([]byte(nil), s.buffer[len(s.buffer)-256*1024:]...)
+			}
+			subs := make([]*terminalSubscriber, 0, len(s.subs))
+			for sub := range s.subs {
+				subs = append(subs, sub)
+			}
+			s.mu.Unlock()
+			for _, sub := range subs {
+				select {
+				case <-sub.done:
+				case sub.data <- chunk:
+				default:
+				}
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (s *terminalSession) waitForExit() {
+	_ = s.cmd.Wait()
+	s.mu.Lock()
+	s.running = false
+	s.lastActive = time.Now()
+	subs := make([]*terminalSubscriber, 0, len(s.subs))
+	for sub := range s.subs {
+		subs = append(subs, sub)
+	}
+	s.mu.Unlock()
+	message := []byte("\r\n[pmp] terminal session exited\r\n")
+	for _, sub := range subs {
+		select {
+		case <-sub.done:
+		case sub.data <- message:
+		default:
+		}
+	}
+}
+
+func defaultShellCommand() (string, []string) {
+	switch runtime.GOOS {
+	case "windows":
+		if shell := strings.TrimSpace(os.Getenv("COMSPEC")); shell != "" {
+			return shell, nil
+		}
+		return "cmd.exe", nil
+	default:
+		if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
+			return shell, []string{"-l"}
+		}
+		return "/bin/sh", []string{"-l"}
+	}
+}
+
 func watchProjectChanges(hub *websocketHub) {
 	previous, err := snapshotProject()
 	if err != nil {
@@ -1174,6 +1575,64 @@ func headerContainsToken(header http.Header, key string, token string) bool {
 func websocketAccept(key string) string {
 	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func readWebsocketFrame(conn net.Conn) (byte, []byte, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return 0, nil, err
+	}
+	opcode := header[0] & 0x0f
+	payloadLen := int(header[1] & 0x7f)
+	masked := header[1]&0x80 != 0
+
+	switch payloadLen {
+	case 126:
+		extended := make([]byte, 2)
+		if _, err := io.ReadFull(conn, extended); err != nil {
+			return 0, nil, err
+		}
+		payloadLen = int(binary.BigEndian.Uint16(extended))
+	case 127:
+		extended := make([]byte, 8)
+		if _, err := io.ReadFull(conn, extended); err != nil {
+			return 0, nil, err
+		}
+		payloadLen64 := binary.BigEndian.Uint64(extended)
+		if payloadLen64 > 1<<31-1 {
+			return 0, nil, errors.New("websocket payload too large")
+		}
+		payloadLen = int(payloadLen64)
+	}
+
+	mask := make([]byte, 4)
+	if masked {
+		if _, err := io.ReadFull(conn, mask); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return 0, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= mask[i%4]
+		}
+	}
+	return opcode, payload, nil
+}
+
+func writeTerminalPayload(conn net.Conn, messageType string, data []byte) error {
+	payload, err := json.Marshal(map[string]string{
+		"type": messageType,
+		"data": base64.StdEncoding.EncodeToString(data),
+	})
+	if err != nil {
+		return err
+	}
+	return writeWebsocketTextFrame(conn, string(payload))
 }
 
 func writeWebsocketTextFrame(conn net.Conn, message string) error {
@@ -1684,6 +2143,77 @@ const baseStyles = `
     height: 1px;
     opacity: 0;
   }
+  .terminal-layout {
+    display: grid;
+    gap: 0.75rem;
+  }
+  .terminal-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .terminal-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+  }
+  .terminal-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 0.7rem;
+    background: #050505;
+    cursor: pointer;
+    transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  .terminal-tab.active {
+    border-color: var(--action);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--action) 45%, transparent);
+    background: color-mix(in srgb, var(--panel) 84%, var(--action) 16%);
+  }
+  .terminal-tab:hover {
+    transform: translateY(-1px);
+    border-color: var(--action);
+  }
+  .terminal-meta {
+    display: grid;
+    gap: 0.1rem;
+  }
+  .terminal-host {
+    border: 1px solid var(--border);
+    border-radius: 0.85rem;
+    background: #050505;
+    min-height: 32rem;
+    padding: 0.35rem;
+    overflow: hidden;
+  }
+  .terminal-host .xterm {
+    padding: 0.35rem;
+    height: 100%;
+  }
+  .terminal-fallback {
+    min-height: 31rem;
+    padding: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: auto;
+    outline: none;
+    line-height: 1.4;
+  }
+  .terminal-fallback:focus {
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--action) 45%, transparent);
+  }
+  .terminal-empty {
+    display: grid;
+    gap: 0.7rem;
+    place-items: center;
+    min-height: 18rem;
+    text-align: center;
+  }
   @media (max-width: 640px) {
     body { font-size: 13px; }
     .compact {
@@ -1754,6 +2284,348 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
       </div>
     </section>
   </main>
+  ` + liveReloadScript + `
+</body>
+</html>`))
+
+var terminalTemplate = template.Must(template.New("terminal").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pmp terminal</title>
+  <link rel="stylesheet" href="/xterm.css">
+  <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+    </nav>
+    ` + currentProjectBanner + `
+    {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
+    <section class="panel terminal-layout">
+      <div class="terminal-strip">
+        <div>
+          <h2 class="section-title">Integrated Terminal</h2>
+          <div class="instructions">Sessions stay alive while the ` + "`pmp serve`" + ` process is running. Use ` + "`Cmd+T`" + ` on macOS or ` + "`Ctrl+T`" + ` on Linux and Windows to open a new tab.</div>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" onclick="createTerminalSession()">New terminal</button>
+        </div>
+      </div>
+      <div id="terminal-tabs" class="terminal-tabs"></div>
+      <div id="terminal-empty" class="terminal-empty" hidden>
+        <div class="muted">No terminal sessions yet.</div>
+        <button type="button" class="primary" onclick="createTerminalSession()">Create first session</button>
+      </div>
+      <div id="terminal-host" class="terminal-host" hidden></div>
+    </section>
+  </main>
+  <script src="/xterm.js"></script>
+  <script src="/xterm-addon-fit.js"></script>
+  <script>
+    (function() {
+      var bootstrapSessions = {{.SessionsJSON}};
+      var initialActive = {{printf "%q" .ActiveSessionID}};
+      var tabs = document.getElementById('terminal-tabs');
+      var host = document.getElementById('terminal-host');
+      var empty = document.getElementById('terminal-empty');
+      var state = {
+        sessions: bootstrapSessions || [],
+        active: localStorage.getItem('pmp-terminal-active') || initialActive || '',
+        socket: null
+      };
+      var term = null;
+      var fitAddon = null;
+      var fallback = null;
+      var useFallback = false;
+      var terminalDecoder = new TextDecoder();
+
+      function ensureTerminal() {
+        if (term) {
+          return true;
+        }
+        if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
+          useFallback = true;
+          if (!fallback) {
+            fallback = document.createElement('pre');
+            fallback.className = 'terminal-fallback';
+            fallback.tabIndex = 0;
+            fallback.setAttribute('aria-label', 'Terminal fallback');
+            host.innerHTML = '';
+            host.appendChild(fallback);
+            fallback.addEventListener('keydown', handleFallbackKeydown);
+            fallback.addEventListener('paste', handleFallbackPaste);
+            fallback.addEventListener('click', function() {
+              fallback.focus();
+            });
+          }
+          return true;
+        }
+        term = new window.Terminal({
+          convertEol: true,
+          cursorBlink: true,
+          fontFamily: '"Symbols Nerd Font Mono","SauceCodePro Nerd Font Mono","CaskaydiaMono Nerd Font","JetBrainsMono Nerd Font",ui-monospace,monospace',
+          fontSize: 13,
+          theme: {
+            background: '#050505',
+            foreground: '#ffffff',
+            cursor: '#8fd18a'
+          }
+        });
+        fitAddon = new window.FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(host);
+        term.onData(function(data) {
+          sendInput(data);
+        });
+        return true;
+      }
+
+      function decodeBase64(value) {
+        var binary = window.atob(value || '');
+        var bytes = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return terminalDecoder.decode(bytes, { stream: true });
+      }
+
+      function encodeBase64(value) {
+        var bytes = new TextEncoder().encode(value);
+        var binary = '';
+        for (var i = 0; i < bytes.length; i += 1) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
+      }
+
+      function setEmptyState() {
+        var hasSessions = state.sessions.length > 0;
+        empty.hidden = hasSessions;
+        host.hidden = !hasSessions;
+        if (!hasSessions) {
+          tabs.innerHTML = '';
+          if (term) {
+            term.clear();
+          }
+          if (fallback) {
+            fallback.textContent = '';
+          }
+        }
+      }
+
+      function renderTabs() {
+        tabs.innerHTML = '';
+        state.sessions.forEach(function(session) {
+          var button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'terminal-tab' + (session.id === state.active ? ' active' : '');
+          button.onclick = function() {
+            openSession(session.id);
+          };
+
+          var dot = document.createElement('span');
+          dot.className = 'dot ' + (session.running ? 'active' : 'waiting');
+          button.appendChild(dot);
+
+          var meta = document.createElement('span');
+          meta.className = 'terminal-meta';
+          meta.innerHTML = '<strong>' + session.title + '</strong><span class="small">' + session.createdAt + '</span>';
+          button.appendChild(meta);
+
+          tabs.appendChild(button);
+        });
+      }
+
+      function sessionById(id) {
+        return state.sessions.find(function(session) { return session.id === id; }) || null;
+      }
+
+      function resizeTerminal() {
+        if (host.hidden) {
+          return;
+        }
+        if (!ensureTerminal()) {
+          return;
+        }
+        if (useFallback) {
+          return;
+        }
+        fitAddon.fit();
+        if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+          state.socket.send(JSON.stringify({
+            type: 'resize',
+            cols: term.cols,
+            rows: term.rows
+          }));
+        }
+      }
+
+      function attachSocket(id) {
+        if (state.socket) {
+          state.socket.close();
+        }
+        var scheme = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        var socket = new WebSocket(scheme + window.location.host + '/terminal/ws?id=' + encodeURIComponent(id));
+        state.socket = socket;
+        socket.onmessage = function(event) {
+          var payload = JSON.parse(event.data);
+          if (payload.type === 'snapshot') {
+            clearTerminal();
+            writeTerminal(decodeBase64(payload.data));
+            resizeTerminal();
+            return;
+          }
+          if (payload.type === 'data') {
+            writeTerminal(decodeBase64(payload.data));
+          }
+        };
+        socket.onopen = function() {
+          resizeTerminal();
+          focusTerminal();
+        };
+      }
+
+      function sendInput(data) {
+        if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        state.socket.send(JSON.stringify({
+          type: 'input',
+          data: encodeBase64(data)
+        }));
+      }
+
+      function clearTerminal() {
+        if (useFallback && fallback) {
+          fallback.textContent = '';
+          return;
+        }
+        if (term) {
+          term.clear();
+        }
+      }
+
+      function writeTerminal(data) {
+        if (useFallback && fallback) {
+          fallback.textContent += data;
+          fallback.scrollTop = fallback.scrollHeight;
+          return;
+        }
+        if (term) {
+          term.write(data);
+        }
+      }
+
+      function focusTerminal() {
+        if (useFallback && fallback) {
+          fallback.focus();
+          return;
+        }
+        if (term) {
+          term.focus();
+        }
+      }
+
+      function handleFallbackPaste(event) {
+        var text = event.clipboardData ? event.clipboardData.getData('text') : '';
+        if (!text) {
+          return;
+        }
+        event.preventDefault();
+        sendInput(text);
+      }
+
+      function handleFallbackKeydown(event) {
+        var key = event.key;
+        if (event.metaKey && !event.ctrlKey && !event.altKey) {
+          return;
+        }
+        var sequence = '';
+        if (event.ctrlKey && key.length === 1) {
+          var lower = key.toLowerCase();
+          var code = lower.charCodeAt(0);
+          if (code >= 97 && code <= 122) {
+            sequence = String.fromCharCode(code - 96);
+          }
+        } else if (key === 'Enter') {
+          sequence = '\r';
+        } else if (key === 'Backspace') {
+          sequence = '\u007f';
+        } else if (key === 'Tab') {
+          sequence = '\t';
+        } else if (key === 'Escape') {
+          sequence = '\u001b';
+        } else if (key === 'ArrowUp') {
+          sequence = '\u001b[A';
+        } else if (key === 'ArrowDown') {
+          sequence = '\u001b[B';
+        } else if (key === 'ArrowRight') {
+          sequence = '\u001b[C';
+        } else if (key === 'ArrowLeft') {
+          sequence = '\u001b[D';
+        } else if (key.length === 1 && !event.ctrlKey && !event.altKey) {
+          sequence = key;
+        }
+        if (!sequence) {
+          return;
+        }
+        event.preventDefault();
+        sendInput(sequence);
+      }
+
+      function openSession(id) {
+        if (!sessionById(id)) {
+          return;
+        }
+        state.active = id;
+        localStorage.setItem('pmp-terminal-active', id);
+        renderTabs();
+        setEmptyState();
+        clearTerminal();
+        terminalDecoder = new TextDecoder();
+        if (!ensureTerminal()) {
+          return;
+        }
+        attachSocket(id);
+        window.history.replaceState({}, '', '/terminal?session=' + encodeURIComponent(id));
+      }
+
+      window.createTerminalSession = function() {
+        fetch('/terminal/sessions', { method: 'POST' })
+          .then(function(response) { return response.json(); })
+          .then(function(session) {
+            state.sessions.unshift(session);
+            renderTabs();
+            openSession(session.id);
+          });
+      };
+
+      window.addEventListener('resize', resizeTerminal);
+      window.addEventListener('keydown', function(event) {
+        var isNewTab = (event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && String(event.key).toLowerCase() === 't';
+        if (!isNewTab) {
+          return;
+        }
+        event.preventDefault();
+        window.createTerminalSession();
+      });
+
+      setEmptyState();
+      renderTabs();
+      if (state.active) {
+        openSession(state.active);
+      } else if (state.sessions.length > 0) {
+        openSession(state.sessions[0].id);
+      } else {
+        window.createTerminalSession();
+      }
+    })();
+  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))
