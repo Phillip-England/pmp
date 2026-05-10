@@ -20,39 +20,149 @@ type compileRange struct {
 
 type compileTarget struct {
 	Range          *compileRange
+	FromMark       bool
 	OutputFile     string
 	IncludedSkills []string
+	UpdateMark     bool
+	ToStdout       bool
 }
 
 func parseCompileArgs(args []string) (compileTarget, error) {
-	switch len(args) {
-	case 0:
-		return compileTarget{}, nil
-	case 1:
-		return compileTarget{OutputFile: args[0]}, nil
-	case 2:
-		start, startErr := strconv.Atoi(args[0])
-		end, endErr := strconv.Atoi(args[1])
-		if startErr == nil && endErr == nil {
-			return compileTarget{Range: &compileRange{Start: start, End: end}}, nil
+	target := compileTarget{UpdateMark: true}
+
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--from-mark":
+			if target.Range != nil || target.FromMark {
+				return compileTarget{}, errors.New("choose only one compile source: default all, `--from-mark`, or `--range <start> <end>`")
+			}
+			target.FromMark = true
+		case arg == "--range":
+			if target.Range != nil || target.FromMark {
+				return compileTarget{}, errors.New("choose only one compile source: default all, `--from-mark`, or `--range <start> <end>`")
+			}
+			if i+2 >= len(args) {
+				return compileTarget{}, errors.New("usage: `pmp compile --range <start> <end>`")
+			}
+			start, err := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if err != nil {
+				return compileTarget{}, fmt.Errorf("invalid start index %q", args[i+1])
+			}
+			end, err := strconv.Atoi(strings.TrimSpace(args[i+2]))
+			if err != nil {
+				return compileTarget{}, fmt.Errorf("invalid end index %q", args[i+2])
+			}
+			target.Range = &compileRange{Start: start, End: end}
+			i += 2
+		case arg == "--output":
+			if i+1 >= len(args) {
+				return compileTarget{}, errors.New("usage: `pmp compile --output <file>`")
+			}
+			target.OutputFile = strings.TrimSpace(args[i+1])
+			if target.OutputFile == "" {
+				return compileTarget{}, errors.New("output file cannot be empty")
+			}
+			i++
+		case arg == "--stdout":
+			target.ToStdout = true
+		case strings.HasPrefix(arg, "--update-mark="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--update-mark="))
+			parsed, err := parseBoolFlag(value)
+			if err != nil {
+				return compileTarget{}, fmt.Errorf("invalid --update-mark value %q", value)
+			}
+			target.UpdateMark = parsed
+		case arg == "--update-mark":
+			target.UpdateMark = true
+		case arg == "--skill":
+			if i+1 >= len(args) {
+				return compileTarget{}, errors.New("usage: `pmp compile --skill <name>`")
+			}
+			name := strings.TrimSpace(args[i+1])
+			if name == "" {
+				return compileTarget{}, errors.New("skill name cannot be empty")
+			}
+			target.IncludedSkills = append(target.IncludedSkills, name)
+			i++
+		case strings.HasPrefix(arg, "--skills="):
+			names, err := parseSkillsFlagValue(strings.TrimPrefix(arg, "--skills="))
+			if err != nil {
+				return compileTarget{}, err
+			}
+			target.IncludedSkills = append(target.IncludedSkills, names...)
+		case arg == "--skills":
+			if i+1 >= len(args) {
+				return compileTarget{}, errors.New("usage: `pmp compile --skills <comma-separated names>`")
+			}
+			names, err := parseSkillsFlagValue(args[i+1])
+			if err != nil {
+				return compileTarget{}, err
+			}
+			target.IncludedSkills = append(target.IncludedSkills, names...)
+			i++
+		default:
+			return compileTarget{}, fmt.Errorf("unknown compile argument %q", arg)
 		}
-		return compileTarget{}, errors.New("usage: `pmp compile`, `pmp compile <file>`, `pmp compile <start> <end>`, or `pmp compile <start> <end> <file>`")
-	case 3:
-		start, err := strconv.Atoi(args[0])
-		if err != nil {
-			return compileTarget{}, fmt.Errorf("invalid start index %q", args[0])
-		}
-		end, err := strconv.Atoi(args[1])
-		if err != nil {
-			return compileTarget{}, fmt.Errorf("invalid end index %q", args[1])
-		}
-		return compileTarget{
-			Range:      &compileRange{Start: start, End: end},
-			OutputFile: args[2],
-		}, nil
-	default:
-		return compileTarget{}, errors.New("usage: `pmp compile`, `pmp compile <file>`, `pmp compile <start> <end>`, or `pmp compile <start> <end> <file>`")
 	}
+
+	if target.OutputFile != "" && target.ToStdout {
+		return compileTarget{}, errors.New("choose only one output mode: `--output <file>` or `--stdout`")
+	}
+	target.IncludedSkills = dedupeStrings(target.IncludedSkills)
+	return target, nil
+}
+
+func parseBoolFlag(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, errors.New("invalid boolean")
+	}
+}
+
+func parseSkillsFlagValue(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "{")
+	raw = strings.TrimSuffix(raw, "}")
+	if raw == "" {
+		return nil, errors.New("skills list cannot be empty")
+	}
+
+	parts := strings.Split(raw, ",")
+	names := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		name = strings.Trim(name, `"'`)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return nil, errors.New("skills list cannot be empty")
+	}
+	return names, nil
+}
+
+func dedupeStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		key := strings.ToLower(strings.TrimSpace(value))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, strings.TrimSpace(value))
+	}
+	return out
 }
 
 func runCompileCommand(args []string) error {
@@ -72,47 +182,66 @@ func runCompile(target compileTarget) error {
 	if err != nil {
 		return err
 	}
+	memories, err := loadMemories()
+	if err != nil {
+		return err
+	}
 	skills, err := loadSkills()
 	if err != nil {
 		return err
 	}
 
-	compiled, err := compilePrompts(prompts, target.Range, skills, target.IncludedSkills)
+	selected, err := resolveCompileIndexesCLI(target, len(prompts))
 	if err != nil {
 		return err
 	}
-	compiled = prefixCompiledWithInstructions(projectInstructions, compiled)
 
-	if target.OutputFile != "" {
-		return writeCompiledFile(target.OutputFile, compiled)
+	compiled, err := compilePromptIndexes(prompts, selected, skills, target.IncludedSkills)
+	if err != nil {
+		return err
 	}
-	return copyCompiledToClipboard(compiled)
+	compiled = prefixCompiledWithInstructions(projectInstructions, memories, compiled)
+
+	if target.UpdateMark && len(selected) > 0 {
+		if err := markCompiledPrompt(selected); err != nil {
+			return err
+		}
+	}
+
+	switch {
+	case target.OutputFile != "":
+		return writeCompiledFile(target.OutputFile, compiled)
+	case target.ToStdout:
+		_, err := os.Stdout.WriteString(compiled)
+		return err
+	default:
+		return copyCompiledToClipboard(compiled)
+	}
+}
+
+func resolveCompileIndexesCLI(target compileTarget, promptCount int) ([]int, error) {
+	switch {
+	case target.FromMark:
+		marks, err := loadMarks()
+		if err != nil {
+			return nil, err
+		}
+		return indexesFromMarkExclusive(promptCount, marks)
+	case target.Range != nil:
+		return compileIndexesForRange(promptCount, *target.Range)
+	default:
+		indexes := make([]int, 0, promptCount)
+		for i := 0; i < promptCount; i++ {
+			indexes = append(indexes, i)
+		}
+		return indexes, nil
+	}
 }
 
 func compilePrompts(prompts []Prompt, rng *compileRange, skills []Skill, includedSkills []string) (string, error) {
-	start := 0
-	end := len(prompts) - 1
-	if rng != nil && len(prompts) > 0 {
-		start = rng.Start
-		end = rng.End
-	}
-
-	if rng != nil && (start < 0 || end < 0) {
-		return "", errors.New("compile range indexes must be non-negative")
-	}
-	if rng != nil && start > end {
-		return "", errors.New("compile start index must be less than or equal to end index")
-	}
-	if rng != nil && end >= len(prompts) {
-		return "", fmt.Errorf("compile range out of bounds; highest prompt index is %d", len(prompts)-1)
-	}
-
-	indexes := []int{}
-	if len(prompts) > 0 {
-		indexes = make([]int, 0, end-start+1)
-		for i := start; i <= end; i++ {
-			indexes = append(indexes, i)
-		}
+	indexes, err := resolveCompileIndexesCLI(compileTarget{Range: rng}, len(prompts))
+	if err != nil {
+		return "", err
 	}
 	return compilePromptIndexes(prompts, indexes, skills, includedSkills)
 }
@@ -137,7 +266,7 @@ func compilePromptIndexes(prompts []Prompt, indexes []int, skills []Skill, inclu
 		promptBody.WriteString(" -->\n")
 		promptBody.WriteString(strings.TrimSpace(prompt.Markdown))
 	}
-	return renderCompileDocument("", renderSelectedSkills(skills, includedSkills), promptBody.String()), nil
+	return renderCompileDocument("", []Memory{}, renderSelectedSkills(skills, includedSkills), promptBody.String()), nil
 }
 
 func renderSelectedSkills(skills []Skill, includedSkills []string) string {
@@ -156,18 +285,31 @@ func renderSelectedSkills(skills []Skill, includedSkills []string) string {
 	return strings.Join(blocks, "\n\n")
 }
 
-func prefixCompiledWithInstructions(instructions string, compiled string) string {
+func prefixCompiledWithInstructions(instructions string, memories []Memory, compiled string) string {
 	skills := extractCompileSection("Skills", compiled)
 	prompts := extractCompileSection("Prompts", compiled)
 	if skills == "" && prompts == "" {
 		prompts = compiled
 	}
-	return renderCompileDocument(instructions, skills, prompts)
+	return renderCompileDocument(instructions, memories, skills, prompts)
 }
 
-func renderCompileDocument(instructions string, skills string, prompts string) string {
+func renderCompileDocument(instructions string, memories []Memory, skills string, prompts string) string {
 	var b strings.Builder
 	writeCompileSection(&b, "Instructions", "Read this section first. It explains how to use the compiled material and how to write response notes back into the project.", instructions, "_No instructions provided._")
+	b.WriteString("\n\n")
+	b.WriteString("<!-- MEMORY SECTION -->\n")
+	b.WriteString("# Memory Section\n")
+	b.WriteString("This section contains project-specific context that should be applied throughout the work.\n\n")
+	if len(memories) == 0 {
+		b.WriteString("_No memories recorded._")
+	} else {
+		for _, m := range memories {
+			b.WriteString(strings.TrimSpace(m.Body))
+			b.WriteString("\n\n")
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("\n\n")
 	writeCompileSection(&b, "Skills", "These are the optional selected skills included for this compilation.", skills, "_No skills selected._")
 	b.WriteString("\n\n")
@@ -197,6 +339,7 @@ func extractCompileSection(title string, compiled string) string {
 	startMarker := "<!-- " + strings.ToUpper(title) + " SECTION -->"
 	nextMarkers := []string{
 		"<!-- INSTRUCTIONS SECTION -->",
+		"<!-- MEMORY SECTION -->",
 		"<!-- SKILLS SECTION -->",
 		"<!-- PROMPTS SECTION -->",
 	}
@@ -240,8 +383,8 @@ func copyCompiledToClipboard(compiled string) error {
 	}
 	cmd := exec.Command(command, args...)
 	cmd.Stdin = strings.NewReader(compiled)
-	if err := cmd.Run(); err != nil {
-		return err
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("copy to clipboard with %s failed: %w (%s)", command, err, strings.TrimSpace(string(output)))
 	}
 	fmt.Println("compiled prompts copied to clipboard")
 	return nil
@@ -250,20 +393,18 @@ func copyCompiledToClipboard(compiled string) error {
 func clipboardCommand() (string, []string, error) {
 	switch runtime.GOOS {
 	case "darwin":
-		if _, err := exec.LookPath("pbcopy"); err == nil {
-			return "pbcopy", nil, nil
-		}
+		return "pbcopy", nil, nil
 	case "linux":
+		if _, err := exec.LookPath("wl-copy"); err == nil {
+			return "wl-copy", nil, nil
+		}
 		if _, err := exec.LookPath("xclip"); err == nil {
 			return "xclip", []string{"-selection", "clipboard"}, nil
 		}
-		if _, err := exec.LookPath("xsel"); err == nil {
-			return "xsel", []string{"--clipboard", "--input"}, nil
-		}
+		return "", nil, errors.New("no clipboard command found; install `wl-copy` or `xclip`, or pass `--stdout` or `--output <file>`")
 	case "windows":
-		if _, err := exec.LookPath("clip"); err == nil {
-			return "clip", nil, nil
-		}
+		return "clip", nil, nil
+	default:
+		return "", nil, fmt.Errorf("clipboard copy is not supported on %s; pass `--stdout` or `--output <file>`", runtime.GOOS)
 	}
-	return "", nil, errors.New("no clipboard command available; provide a target file to `pmp compile` instead")
 }

@@ -34,6 +34,8 @@ func run(args []string) error {
 			return errors.New("`pmp list` does not accept arguments")
 		}
 		return runList()
+	case "new":
+		return runNewCommand(args[1:])
 	case "mark":
 		return runMark(args[1:])
 	case "unmark":
@@ -56,10 +58,11 @@ func printUsage() {
 Usage:
   pmp         Auto-initialize and open the web UI on the new prompt page
   pmp init    Initialize prompt storage in the current directory
+  pmp new     Save a prompt from the CLI with a title and body
   pmp serve   Serve the browser UI for browsing and compiling prompts
   pmp list    List prompts in reverse order, newest first
   pmp mark    Mark prompt indexes for tracking
   pmp unmark  Remove prompt marks
   pmp delete  Delete prompts by index or inclusive range
-  pmp compile Compile prompt history to the clipboard or a file`)
+  pmp compile Compile prompt history from the CLI`)
 }

@@ -10,6 +10,28 @@ import (
 	"time"
 )
 
+func runNewCommand(args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: `pmp new <title> <body>`")
+	}
+
+	prompt, err := parsePromptFields(args[0], args[1])
+	if err != nil {
+		return err
+	}
+
+	targetPath, err := savePrompt(prompt)
+	if err != nil {
+		return err
+	}
+	if err := ensureInitialPromptMark(); err != nil {
+		return err
+	}
+
+	_, _ = os.Stdout.WriteString("saved " + filepath.Base(targetPath) + "\n")
+	return nil
+}
+
 func runPrompt() error {
 	if err := ensureProject(); err != nil {
 		return err
@@ -42,6 +64,9 @@ func runPrompt() error {
 
 	targetPath, err := savePrompt(prompt)
 	if err != nil {
+		return err
+	}
+	if err := ensureInitialPromptMark(); err != nil {
 		return err
 	}
 	if err := os.WriteFile(draftPath, nil, 0o644); err != nil {

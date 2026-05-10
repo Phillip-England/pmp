@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,8 +23,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/creack/pty"
 )
 
 const serveAddress = "127.0.0.1:8765"
@@ -90,14 +89,26 @@ type instructionsPageData struct {
 	Body           string
 }
 
-type terminalPageData struct {
-	Nav             []navItem
-	CurrentProject  currentProjectData
-	AccentColor     string
-	Sessions        []terminalSessionSummary
-	SessionsJSON    template.JS
-	ActiveSessionID string
-	Error           string
+type memoryPageData struct {
+	Nav            []navItem
+	CurrentProject currentProjectData
+	Error          string
+	Saved          bool
+	AccentColor    string
+	Memories       []MemoryView
+	TotalMemories  int
+}
+
+type MemoryView struct {
+	Index      int
+	Title      string
+	Timestamp  string
+	DateValue  string
+	SearchText string
+	HTMLBody   template.HTML
+	ElementID  string
+	Body       string
+	Path       string
 }
 
 type promptListPage struct {
@@ -142,47 +153,6 @@ type projectSnapshot struct {
 	LatestMod int64
 }
 
-type terminalSessionSummary struct {
-	ID         string `json:"id"`
-	Title      string `json:"title"`
-	CreatedAt  string `json:"createdAt"`
-	Running    bool   `json:"running"`
-	LastActive int64  `json:"lastActive"`
-}
-
-type terminalSession struct {
-	id         string
-	title      string
-	cmd        *exec.Cmd
-	pty        *os.File
-	createdAt  time.Time
-	lastActive time.Time
-	running    bool
-	buffer     []byte
-	subs       map[*terminalSubscriber]struct{}
-	mu         sync.Mutex
-}
-
-type terminalManager struct {
-	mu       sync.Mutex
-	sessions map[string]*terminalSession
-	nextID   int
-}
-
-type terminalClientMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data"`
-	Cols uint16 `json:"cols"`
-	Rows uint16 `json:"rows"`
-}
-
-type terminalSubscriber struct {
-	data chan []byte
-	done chan struct{}
-}
-
-var terminals = newTerminalManager()
-
 type projectsPageData struct {
 	Nav            []navItem
 	CurrentProject currentProjectData
@@ -200,10 +170,6 @@ func newWebsocketHub() *websocketHub {
 	return &websocketHub{conns: map[net.Conn]struct{}{}}
 }
 
-func newTerminalManager() *terminalManager {
-	return &terminalManager{sessions: map[string]*terminalSession{}}
-}
-
 func (h *websocketHub) add(conn net.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -214,6 +180,24 @@ func (h *websocketHub) remove(conn net.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.conns, conn)
+}
+
+func writeWebsocketTextFrame(conn net.Conn, message string) error {
+	payload := []byte(message)
+	frame := []byte{0x81}
+
+	switch {
+	case len(payload) < 126:
+		frame = append(frame, byte(len(payload)))
+	case len(payload) <= 65535:
+		frame = append(frame, 126, byte(len(payload)>>8), byte(len(payload)))
+	default:
+		return errors.New("websocket payload too large")
+	}
+
+	frame = append(frame, payload...)
+	_, err := conn.Write(frame)
+	return err
 }
 
 func (h *websocketHub) broadcastText(message string) {
@@ -248,14 +232,10 @@ func runServe() error {
 	mux.HandleFunc("/", serveHome)
 	mux.HandleFunc("/new", serveNewPrompt)
 	mux.HandleFunc("/instructions", serveInstructions)
+	mux.HandleFunc("/memory", serveMemory)
+	mux.HandleFunc("/memory/api", serveMemoryAPI)
 	mux.HandleFunc("/skills", serveSkills)
 	mux.HandleFunc("/settings", serveSettings)
-	mux.Handle("/xterm.css", http.FileServer(http.FS(uiAssets)))
-	mux.Handle("/xterm.js", http.FileServer(http.FS(uiAssets)))
-	mux.Handle("/xterm-addon-fit.js", http.FileServer(http.FS(uiAssets)))
-	mux.HandleFunc("/terminal", serveTerminal)
-	mux.HandleFunc("/terminal/sessions", serveTerminalSessions)
-	mux.HandleFunc("/terminal/ws", serveTerminalWS)
 	mux.HandleFunc("/prompts", servePrompts)
 	mux.HandleFunc("/responses", serveResponses)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
@@ -440,157 +420,6 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 	renderTemplate(w, promptsTemplate, data)
 }
 
-func serveTerminal(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	themeSettings, err := loadThemeSettings()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	currentProject, err := loadCurrentProjectData()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	sessions := terminals.summaries()
-	if len(sessions) == 0 {
-		session, err := terminals.create()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		sessions = []terminalSessionSummary{session.summary()}
-	}
-	activeID := strings.TrimSpace(r.URL.Query().Get("session"))
-	if activeID == "" && len(sessions) > 0 {
-		activeID = sessions[0].ID
-	}
-	sessionsJSON, err := json.Marshal(sessions)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	data := terminalPageData{
-		Nav:             buildNav("/terminal"),
-		CurrentProject:  currentProject,
-		AccentColor:     themeSettings.AccentColor,
-		Sessions:        sessions,
-		SessionsJSON:    template.JS(sessionsJSON),
-		ActiveSessionID: activeID,
-	}
-	renderTemplate(w, terminalTemplate, data)
-}
-
-func serveTerminalSessions(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, terminals.summaries(), http.StatusOK)
-	case http.MethodPost:
-		session, err := terminals.create()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		writeJSON(w, session.summary(), http.StatusCreated)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func serveTerminalWS(w http.ResponseWriter, r *http.Request) {
-	if !headerContainsToken(r.Header, "Connection", "Upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		http.Error(w, "upgrade required", http.StatusUpgradeRequired)
-		return
-	}
-	id := strings.TrimSpace(r.URL.Query().Get("id"))
-	session, ok := terminals.get(id)
-	if !ok {
-		http.Error(w, "unknown terminal session", http.StatusNotFound)
-		return
-	}
-	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
-	if key == "" {
-		http.Error(w, "missing websocket key", http.StatusBadRequest)
-		return
-	}
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "websocket unsupported", http.StatusInternalServerError)
-		return
-	}
-	conn, rw, err := hijacker.Hijack()
-	if err != nil {
-		return
-	}
-	accept := websocketAccept(key)
-	if _, err := rw.WriteString(
-		"HTTP/1.1 101 Switching Protocols\r\n" +
-			"Upgrade: websocket\r\n" +
-			"Connection: Upgrade\r\n" +
-			"Sec-WebSocket-Accept: " + accept + "\r\n\r\n",
-	); err != nil {
-		_ = conn.Close()
-		return
-	}
-	if err := rw.Flush(); err != nil {
-		_ = conn.Close()
-		return
-	}
-
-	updates := session.subscribe()
-	defer func() {
-		session.unsubscribe(updates)
-		_ = conn.Close()
-	}()
-
-	go func() {
-		if err := writeTerminalPayload(conn, "snapshot", session.snapshot()); err != nil {
-			_ = conn.Close()
-			return
-		}
-		for {
-			select {
-			case <-updates.done:
-				return
-			case chunk := <-updates.data:
-				if err := writeTerminalPayload(conn, "data", chunk); err != nil {
-					_ = conn.Close()
-					return
-				}
-			}
-		}
-	}()
-
-	for {
-		opcode, payload, err := readWebsocketFrame(conn)
-		if err != nil {
-			return
-		}
-		switch opcode {
-		case 0x8:
-			return
-		case 0x1:
-			var msg terminalClientMessage
-			if err := json.Unmarshal(payload, &msg); err != nil {
-				continue
-			}
-			switch msg.Type {
-			case "input":
-				data, err := base64.StdEncoding.DecodeString(msg.Data)
-				if err != nil {
-					continue
-				}
-				_, _ = session.write(data)
-			case "resize":
-				session.resize(msg.Cols, msg.Rows)
-			}
-		}
-	}
-}
-
 func serveResponses(w http.ResponseWriter, r *http.Request) {
 	responses, err := loadResponses()
 	if err != nil {
@@ -636,6 +465,11 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	memories, err := loadMemories()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	skills, err := loadSkills()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -656,7 +490,7 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		writeCompileJSON(w, "", err)
 		return
 	}
-	compiled = prefixCompiledWithInstructions(projectInstructions, compiled)
+	compiled = prefixCompiledWithInstructions(projectInstructions, memories, compiled)
 	if shouldUpdateMark(r.Form) && len(selected) > 0 {
 		if err := markCompiledPrompt(selected); err != nil {
 			writeCompileJSON(w, "", err)
@@ -704,6 +538,11 @@ func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := savePrompt(prompt); err != nil {
+			data.Error = err.Error()
+			renderTemplate(w, newPromptTemplate, data)
+			return
+		}
+		if err := ensureInitialPromptMark(); err != nil {
 			data.Error = err.Error()
 			renderTemplate(w, newPromptTemplate, data)
 			return
@@ -816,6 +655,139 @@ func serveInstructions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func serveMemory(w http.ResponseWriter, r *http.Request) {
+	themeSettings, err := loadThemeSettings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	memories, err := loadMemories()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := memoryPageData{
+		Nav:           buildNav("/memory"),
+		AccentColor:   themeSettings.AccentColor,
+		Memories:      buildMemoryViews(memories),
+		TotalMemories: len(memories),
+	}
+	data.CurrentProject, err = loadCurrentProjectData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderTemplate(w, memoryTemplate, data)
+}
+
+func buildMemoryViews(memories []Memory) []MemoryView {
+	views := make([]MemoryView, 0, len(memories))
+	for i, m := range memories {
+		elementID := fmt.Sprintf("memory-%d", i)
+		bodyHTML := template.HTML(template.HTMLEscapeString(m.Body))
+		views = append(views, MemoryView{
+			Index:     i,
+			Title:     m.Title,
+			Timestamp: m.Timestamp.Local().Format("2006-01-02 15:04:05 MST"),
+			DateValue: m.Timestamp.Local().Format("2006-01-02"),
+			HTMLBody:  bodyHTML,
+			ElementID: elementID,
+			Body:      m.Body,
+			Path:      m.Path,
+		})
+	}
+	return views
+}
+
+func serveMemoryAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		memories, err := loadMemories()
+		if err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, memories, http.StatusOK)
+	case http.MethodPost:
+		if err := parseRequestForm(r); err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusBadRequest)
+			return
+		}
+		title := strings.TrimSpace(r.Form.Get("title"))
+		body := strings.TrimSpace(r.Form.Get("body"))
+		if title == "" {
+			writeJSON(w, map[string]string{"error": "title is required"}, http.StatusBadRequest)
+			return
+		}
+		memory := Memory{
+			Title:     title,
+			Timestamp: time.Now().UTC(),
+			Body:      body,
+		}
+		path, err := saveMemory(memory)
+		if err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+			return
+		}
+		memory.Path = path
+		writeJSON(w, memory, http.StatusCreated)
+	case http.MethodDelete:
+		if err := parseRequestForm(r); err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusBadRequest)
+			return
+		}
+		path := strings.TrimSpace(r.Form.Get("path"))
+		if path == "" {
+			writeJSON(w, map[string]string{"error": "path is required"}, http.StatusBadRequest)
+			return
+		}
+		if err := deleteMemory(path); err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]string{"deleted": path}, http.StatusOK)
+	case http.MethodPut:
+		if err := parseRequestForm(r); err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusBadRequest)
+			return
+		}
+		path := strings.TrimSpace(r.Form.Get("path"))
+		title := strings.TrimSpace(r.Form.Get("title"))
+		body := strings.TrimSpace(r.Form.Get("body"))
+		if path == "" {
+			writeJSON(w, map[string]string{"error": "path is required"}, http.StatusBadRequest)
+			return
+		}
+		if title == "" {
+			writeJSON(w, map[string]string{"error": "title is required"}, http.StatusBadRequest)
+			return
+		}
+		memory, err := readMemoryFile(path)
+		if err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+			return
+		}
+		originalPath := memory.Path
+		memory.Title = title
+		memory.Body = body
+		updatedPath, err := saveMemory(memory)
+		if err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+			return
+		}
+		if updatedPath != originalPath {
+			if err := deleteMemory(originalPath); err != nil {
+				writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+				return
+			}
+		}
+		memory.Path = updatedPath
+		writeJSON(w, memory, http.StatusOK)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func serveSkills(w http.ResponseWriter, r *http.Request) {
 	themeSettings, err := loadThemeSettings()
 	if err != nil {
@@ -919,6 +891,65 @@ func loadPromptState() ([]Prompt, map[int]bool, error) {
 	return prompts, marks, nil
 }
 
+func parseRequestForm(r *http.Request) error {
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return r.ParseForm()
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
+		if r.Method == http.MethodPost {
+			return r.ParseMultipartForm(32 << 20)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		form := make(url.Values)
+		reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+		for {
+			part, err := reader.NextPart()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			name := part.FormName()
+			if name == "" {
+				_ = part.Close()
+				continue
+			}
+			value, err := io.ReadAll(part)
+			_ = part.Close()
+			if err != nil {
+				return err
+			}
+			form.Add(name, string(value))
+		}
+		for key, values := range r.URL.Query() {
+			for _, value := range values {
+				form.Add(key, value)
+			}
+		}
+		r.Form = form
+		r.PostForm = form
+		return nil
+	}
+
+	if mediaType == "" {
+		return r.ParseForm()
+	}
+
+	if !strings.HasPrefix(mediaType, "application/x-www-form-urlencoded") {
+		return r.ParseForm()
+	}
+	return r.ParseForm()
+}
+
 func currentMarkedIndex(marks map[int]bool) (int, bool) {
 	if len(marks) == 0 {
 		return 0, false
@@ -940,13 +971,33 @@ func markCompiledPrompt(selected []int) error {
 	return saveMarks(map[int]bool{selected[len(selected)-1]: true})
 }
 
+func ensureInitialPromptMark() error {
+	marks, err := loadMarks()
+	if err != nil {
+		return err
+	}
+	if len(marks) > 0 {
+		return nil
+	}
+
+	prompts, err := loadPrompts()
+	if err != nil {
+		return err
+	}
+	if len(prompts) == 0 {
+		return nil
+	}
+
+	return saveMarks(map[int]bool{0: true})
+}
+
 func buildNav(current string) []navItem {
 	return []navItem{
 		{Label: "New", Href: "/new", Current: current == "/new"},
 		{Label: "Projects", Href: "/projects", Current: current == "/projects"},
 		{Label: "Instructions", Href: "/instructions", Current: current == "/instructions"},
+		{Label: "Memory", Href: "/memory", Current: current == "/memory"},
 		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
-		{Label: "Terminal", Href: "/terminal", Current: current == "/terminal"},
 		{Label: "Skills", Href: "/skills", Current: current == "/skills"},
 		{Label: "Prompts", Href: "/prompts", Current: current == "/prompts"},
 		{Label: "Responses", Href: "/responses", Current: current == "/responses"},
@@ -1063,24 +1114,7 @@ func buildSkillToggles(skills []Skill, included []string) []SkillToggle {
 	return toggles
 }
 
-func indexesForwardFromMark(promptCount int, marks map[int]bool) []int {
-	markedIndex, ok := currentMarkedIndex(marks)
-	if !ok {
-		return nil
-	}
-
-	if markedIndex+1 >= promptCount {
-		return []int{}
-	}
-
-	indexes := make([]int, 0, promptCount-markedIndex-1)
-	for i := markedIndex + 1; i < promptCount; i++ {
-		indexes = append(indexes, i)
-	}
-	return indexes
-}
-
-func indexesFromMarkInclusive(promptCount int, marks map[int]bool) ([]int, error) {
+func indexesFromMarkExclusive(promptCount int, marks map[int]bool) ([]int, error) {
 	markedIndex, ok := currentMarkedIndex(marks)
 	if !ok {
 		return nil, errors.New("no marked prompt available")
@@ -1088,8 +1122,12 @@ func indexesFromMarkInclusive(promptCount int, marks map[int]bool) ([]int, error
 	if markedIndex < 0 || markedIndex >= promptCount {
 		return nil, fmt.Errorf("marked prompt index %d is out of bounds; highest prompt index is %d", markedIndex, promptCount-1)
 	}
-	indexes := make([]int, 0, promptCount-markedIndex)
-	for i := markedIndex; i < promptCount; i++ {
+	if markedIndex+1 >= promptCount {
+		return []int{}, nil
+	}
+
+	indexes := make([]int, 0, promptCount-markedIndex-1)
+	for i := markedIndex + 1; i < promptCount; i++ {
 		indexes = append(indexes, i)
 	}
 	return indexes, nil
@@ -1137,7 +1175,7 @@ func resolveCompileIndexes(values url.Values, promptCount int) ([]int, error) {
 		if err != nil {
 			return nil, err
 		}
-		return indexesFromMarkInclusive(promptCount, marks)
+		return indexesFromMarkExclusive(promptCount, marks)
 	case "range":
 		start, err := strconv.Atoi(strings.TrimSpace(values.Get("range_start")))
 		if err != nil {
@@ -1265,184 +1303,6 @@ func openBrowser(url string) error {
 	return cmd.Start()
 }
 
-func (m *terminalManager) summaries() []terminalSessionSummary {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	summaries := make([]terminalSessionSummary, 0, len(m.sessions))
-	for _, session := range m.sessions {
-		summaries = append(summaries, session.summary())
-	}
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].LastActive > summaries[j].LastActive
-	})
-	return summaries
-}
-
-func (m *terminalManager) get(id string) (*terminalSession, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	session, ok := m.sessions[id]
-	return session, ok
-}
-
-func (m *terminalManager) create() (*terminalSession, error) {
-	shell, args := defaultShellCommand()
-	cmd := exec.Command(shell, args...)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	cmd.Dir, _ = projectRoot()
-
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		return nil, err
-	}
-
-	m.mu.Lock()
-	m.nextID++
-	id := fmt.Sprintf("term-%d", m.nextID)
-	session := &terminalSession{
-		id:         id,
-		title:      filepath.Base(shell),
-		cmd:        cmd,
-		pty:        ptmx,
-		createdAt:  time.Now(),
-		lastActive: time.Now(),
-		running:    true,
-		subs:       map[*terminalSubscriber]struct{}{},
-	}
-	m.sessions[id] = session
-	m.mu.Unlock()
-
-	go session.captureOutput()
-	go session.waitForExit()
-
-	return session, nil
-}
-
-func (s *terminalSession) summary() terminalSessionSummary {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return terminalSessionSummary{
-		ID:         s.id,
-		Title:      s.title,
-		CreatedAt:  s.createdAt.Local().Format("2006-01-02 15:04:05 MST"),
-		Running:    s.running,
-		LastActive: s.lastActive.UnixNano(),
-	}
-}
-
-func (s *terminalSession) snapshot() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]byte(nil), s.buffer...)
-}
-
-func (s *terminalSession) subscribe() *terminalSubscriber {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sub := &terminalSubscriber{
-		data: make(chan []byte, 128),
-		done: make(chan struct{}),
-	}
-	s.subs[sub] = struct{}{}
-	return sub
-}
-
-func (s *terminalSession) unsubscribe(sub *terminalSubscriber) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.subs[sub]; !ok {
-		return
-	}
-	delete(s.subs, sub)
-	close(sub.done)
-}
-
-func (s *terminalSession) write(data []byte) (int, error) {
-	s.mu.Lock()
-	s.lastActive = time.Now()
-	ptmx := s.pty
-	s.mu.Unlock()
-	return ptmx.Write(data)
-}
-
-func (s *terminalSession) resize(cols uint16, rows uint16) {
-	if cols == 0 || rows == 0 {
-		return
-	}
-	s.mu.Lock()
-	s.lastActive = time.Now()
-	ptmx := s.pty
-	s.mu.Unlock()
-	_ = pty.Setsize(ptmx, &pty.Winsize{Cols: cols, Rows: rows})
-}
-
-func (s *terminalSession) captureOutput() {
-	buf := make([]byte, 4096)
-	for {
-		n, err := s.pty.Read(buf)
-		if n > 0 {
-			chunk := append([]byte(nil), buf[:n]...)
-			s.mu.Lock()
-			s.lastActive = time.Now()
-			s.buffer = append(s.buffer, chunk...)
-			if len(s.buffer) > 256*1024 {
-				s.buffer = append([]byte(nil), s.buffer[len(s.buffer)-256*1024:]...)
-			}
-			subs := make([]*terminalSubscriber, 0, len(s.subs))
-			for sub := range s.subs {
-				subs = append(subs, sub)
-			}
-			s.mu.Unlock()
-			for _, sub := range subs {
-				select {
-				case <-sub.done:
-				case sub.data <- chunk:
-				default:
-				}
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (s *terminalSession) waitForExit() {
-	_ = s.cmd.Wait()
-	s.mu.Lock()
-	s.running = false
-	s.lastActive = time.Now()
-	subs := make([]*terminalSubscriber, 0, len(s.subs))
-	for sub := range s.subs {
-		subs = append(subs, sub)
-	}
-	s.mu.Unlock()
-	message := []byte("\r\n[pmp] terminal session exited\r\n")
-	for _, sub := range subs {
-		select {
-		case <-sub.done:
-		case sub.data <- message:
-		default:
-		}
-	}
-}
-
-func defaultShellCommand() (string, []string) {
-	switch runtime.GOOS {
-	case "windows":
-		if shell := strings.TrimSpace(os.Getenv("COMSPEC")); shell != "" {
-			return shell, nil
-		}
-		return "cmd.exe", nil
-	default:
-		if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
-			return shell, []string{"-l"}
-		}
-		return "/bin/sh", []string{"-l"}
-	}
-}
-
 func watchProjectChanges(hub *websocketHub) {
 	previous, err := snapshotProject()
 	if err != nil {
@@ -1503,6 +1363,11 @@ func snapshotProject() (projectSnapshot, error) {
 	}
 
 	return snapshot, nil
+}
+
+func websocketAccept(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 func (h *websocketHub) handle(w http.ResponseWriter, r *http.Request) {
@@ -1570,87 +1435,6 @@ func headerContainsToken(header http.Header, key string, token string) bool {
 		}
 	}
 	return false
-}
-
-func websocketAccept(key string) string {
-	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	return base64.StdEncoding.EncodeToString(sum[:])
-}
-
-func readWebsocketFrame(conn net.Conn) (byte, []byte, error) {
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return 0, nil, err
-	}
-	opcode := header[0] & 0x0f
-	payloadLen := int(header[1] & 0x7f)
-	masked := header[1]&0x80 != 0
-
-	switch payloadLen {
-	case 126:
-		extended := make([]byte, 2)
-		if _, err := io.ReadFull(conn, extended); err != nil {
-			return 0, nil, err
-		}
-		payloadLen = int(binary.BigEndian.Uint16(extended))
-	case 127:
-		extended := make([]byte, 8)
-		if _, err := io.ReadFull(conn, extended); err != nil {
-			return 0, nil, err
-		}
-		payloadLen64 := binary.BigEndian.Uint64(extended)
-		if payloadLen64 > 1<<31-1 {
-			return 0, nil, errors.New("websocket payload too large")
-		}
-		payloadLen = int(payloadLen64)
-	}
-
-	mask := make([]byte, 4)
-	if masked {
-		if _, err := io.ReadFull(conn, mask); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		return 0, nil, err
-	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	return opcode, payload, nil
-}
-
-func writeTerminalPayload(conn net.Conn, messageType string, data []byte) error {
-	payload, err := json.Marshal(map[string]string{
-		"type": messageType,
-		"data": base64.StdEncoding.EncodeToString(data),
-	})
-	if err != nil {
-		return err
-	}
-	return writeWebsocketTextFrame(conn, string(payload))
-}
-
-func writeWebsocketTextFrame(conn net.Conn, message string) error {
-	payload := []byte(message)
-	frame := []byte{0x81}
-
-	switch {
-	case len(payload) < 126:
-		frame = append(frame, byte(len(payload)))
-	case len(payload) <= 65535:
-		frame = append(frame, 126, byte(len(payload)>>8), byte(len(payload)))
-	default:
-		return errors.New("websocket payload too large")
-	}
-
-	frame = append(frame, payload...)
-	_, err := conn.Write(frame)
-	return err
 }
 
 const baseStyles = `
@@ -2143,77 +1927,6 @@ const baseStyles = `
     height: 1px;
     opacity: 0;
   }
-  .terminal-layout {
-    display: grid;
-    gap: 0.75rem;
-  }
-  .terminal-strip {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.6rem;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .terminal-tabs {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.55rem;
-  }
-  .terminal-tab {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.55rem 0.75rem;
-    border: 1px solid var(--border);
-    border-radius: 0.7rem;
-    background: #050505;
-    cursor: pointer;
-    transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
-  }
-  .terminal-tab.active {
-    border-color: var(--action);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--action) 45%, transparent);
-    background: color-mix(in srgb, var(--panel) 84%, var(--action) 16%);
-  }
-  .terminal-tab:hover {
-    transform: translateY(-1px);
-    border-color: var(--action);
-  }
-  .terminal-meta {
-    display: grid;
-    gap: 0.1rem;
-  }
-  .terminal-host {
-    border: 1px solid var(--border);
-    border-radius: 0.85rem;
-    background: #050505;
-    min-height: 32rem;
-    padding: 0.35rem;
-    overflow: hidden;
-  }
-  .terminal-host .xterm {
-    padding: 0.35rem;
-    height: 100%;
-  }
-  .terminal-fallback {
-    min-height: 31rem;
-    padding: 0.85rem;
-    white-space: pre-wrap;
-    word-break: break-word;
-    overflow: auto;
-    outline: none;
-    line-height: 1.4;
-  }
-  .terminal-fallback:focus {
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--action) 45%, transparent);
-  }
-  .terminal-empty {
-    display: grid;
-    gap: 0.7rem;
-    place-items: center;
-    min-height: 18rem;
-    text-align: center;
-  }
   @media (max-width: 640px) {
     body { font-size: 13px; }
     .compact {
@@ -2288,348 +2001,6 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
 </body>
 </html>`))
 
-var terminalTemplate = template.Must(template.New("terminal").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pmp terminal</title>
-  <link rel="stylesheet" href="/xterm.css">
-  <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
-</head>
-<body>
-  <main class="shell">
-    <nav class="nav">
-      ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
-    </nav>
-    ` + currentProjectBanner + `
-    {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
-    <section class="panel terminal-layout">
-      <div class="terminal-strip">
-        <div>
-          <h2 class="section-title">Integrated Terminal</h2>
-          <div class="instructions">Sessions stay alive while the ` + "`pmp serve`" + ` process is running. Use ` + "`Cmd+T`" + ` on macOS or ` + "`Ctrl+T`" + ` on Linux and Windows to open a new tab.</div>
-        </div>
-        <div class="actions">
-          <button type="button" class="primary" onclick="createTerminalSession()">New terminal</button>
-        </div>
-      </div>
-      <div id="terminal-tabs" class="terminal-tabs"></div>
-      <div id="terminal-empty" class="terminal-empty" hidden>
-        <div class="muted">No terminal sessions yet.</div>
-        <button type="button" class="primary" onclick="createTerminalSession()">Create first session</button>
-      </div>
-      <div id="terminal-host" class="terminal-host" hidden></div>
-    </section>
-  </main>
-  <script src="/xterm.js"></script>
-  <script src="/xterm-addon-fit.js"></script>
-  <script>
-    (function() {
-      var bootstrapSessions = {{.SessionsJSON}};
-      var initialActive = {{printf "%q" .ActiveSessionID}};
-      var tabs = document.getElementById('terminal-tabs');
-      var host = document.getElementById('terminal-host');
-      var empty = document.getElementById('terminal-empty');
-      var state = {
-        sessions: bootstrapSessions || [],
-        active: localStorage.getItem('pmp-terminal-active') || initialActive || '',
-        socket: null
-      };
-      var term = null;
-      var fitAddon = null;
-      var fallback = null;
-      var useFallback = false;
-      var terminalDecoder = new TextDecoder();
-
-      function ensureTerminal() {
-        if (term) {
-          return true;
-        }
-        if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
-          useFallback = true;
-          if (!fallback) {
-            fallback = document.createElement('pre');
-            fallback.className = 'terminal-fallback';
-            fallback.tabIndex = 0;
-            fallback.setAttribute('aria-label', 'Terminal fallback');
-            host.innerHTML = '';
-            host.appendChild(fallback);
-            fallback.addEventListener('keydown', handleFallbackKeydown);
-            fallback.addEventListener('paste', handleFallbackPaste);
-            fallback.addEventListener('click', function() {
-              fallback.focus();
-            });
-          }
-          return true;
-        }
-        term = new window.Terminal({
-          convertEol: true,
-          cursorBlink: true,
-          fontFamily: '"Symbols Nerd Font Mono","SauceCodePro Nerd Font Mono","CaskaydiaMono Nerd Font","JetBrainsMono Nerd Font",ui-monospace,monospace',
-          fontSize: 13,
-          theme: {
-            background: '#050505',
-            foreground: '#ffffff',
-            cursor: '#8fd18a'
-          }
-        });
-        fitAddon = new window.FitAddon.FitAddon();
-        term.loadAddon(fitAddon);
-        term.open(host);
-        term.onData(function(data) {
-          sendInput(data);
-        });
-        return true;
-      }
-
-      function decodeBase64(value) {
-        var binary = window.atob(value || '');
-        var bytes = new Uint8Array(binary.length);
-        for (var i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        return terminalDecoder.decode(bytes, { stream: true });
-      }
-
-      function encodeBase64(value) {
-        var bytes = new TextEncoder().encode(value);
-        var binary = '';
-        for (var i = 0; i < bytes.length; i += 1) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        return window.btoa(binary);
-      }
-
-      function setEmptyState() {
-        var hasSessions = state.sessions.length > 0;
-        empty.hidden = hasSessions;
-        host.hidden = !hasSessions;
-        if (!hasSessions) {
-          tabs.innerHTML = '';
-          if (term) {
-            term.clear();
-          }
-          if (fallback) {
-            fallback.textContent = '';
-          }
-        }
-      }
-
-      function renderTabs() {
-        tabs.innerHTML = '';
-        state.sessions.forEach(function(session) {
-          var button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'terminal-tab' + (session.id === state.active ? ' active' : '');
-          button.onclick = function() {
-            openSession(session.id);
-          };
-
-          var dot = document.createElement('span');
-          dot.className = 'dot ' + (session.running ? 'active' : 'waiting');
-          button.appendChild(dot);
-
-          var meta = document.createElement('span');
-          meta.className = 'terminal-meta';
-          meta.innerHTML = '<strong>' + session.title + '</strong><span class="small">' + session.createdAt + '</span>';
-          button.appendChild(meta);
-
-          tabs.appendChild(button);
-        });
-      }
-
-      function sessionById(id) {
-        return state.sessions.find(function(session) { return session.id === id; }) || null;
-      }
-
-      function resizeTerminal() {
-        if (host.hidden) {
-          return;
-        }
-        if (!ensureTerminal()) {
-          return;
-        }
-        if (useFallback) {
-          return;
-        }
-        fitAddon.fit();
-        if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-          state.socket.send(JSON.stringify({
-            type: 'resize',
-            cols: term.cols,
-            rows: term.rows
-          }));
-        }
-      }
-
-      function attachSocket(id) {
-        if (state.socket) {
-          state.socket.close();
-        }
-        var scheme = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-        var socket = new WebSocket(scheme + window.location.host + '/terminal/ws?id=' + encodeURIComponent(id));
-        state.socket = socket;
-        socket.onmessage = function(event) {
-          var payload = JSON.parse(event.data);
-          if (payload.type === 'snapshot') {
-            clearTerminal();
-            writeTerminal(decodeBase64(payload.data));
-            resizeTerminal();
-            return;
-          }
-          if (payload.type === 'data') {
-            writeTerminal(decodeBase64(payload.data));
-          }
-        };
-        socket.onopen = function() {
-          resizeTerminal();
-          focusTerminal();
-        };
-      }
-
-      function sendInput(data) {
-        if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
-          return;
-        }
-        state.socket.send(JSON.stringify({
-          type: 'input',
-          data: encodeBase64(data)
-        }));
-      }
-
-      function clearTerminal() {
-        if (useFallback && fallback) {
-          fallback.textContent = '';
-          return;
-        }
-        if (term) {
-          term.clear();
-        }
-      }
-
-      function writeTerminal(data) {
-        if (useFallback && fallback) {
-          fallback.textContent += data;
-          fallback.scrollTop = fallback.scrollHeight;
-          return;
-        }
-        if (term) {
-          term.write(data);
-        }
-      }
-
-      function focusTerminal() {
-        if (useFallback && fallback) {
-          fallback.focus();
-          return;
-        }
-        if (term) {
-          term.focus();
-        }
-      }
-
-      function handleFallbackPaste(event) {
-        var text = event.clipboardData ? event.clipboardData.getData('text') : '';
-        if (!text) {
-          return;
-        }
-        event.preventDefault();
-        sendInput(text);
-      }
-
-      function handleFallbackKeydown(event) {
-        var key = event.key;
-        if (event.metaKey && !event.ctrlKey && !event.altKey) {
-          return;
-        }
-        var sequence = '';
-        if (event.ctrlKey && key.length === 1) {
-          var lower = key.toLowerCase();
-          var code = lower.charCodeAt(0);
-          if (code >= 97 && code <= 122) {
-            sequence = String.fromCharCode(code - 96);
-          }
-        } else if (key === 'Enter') {
-          sequence = '\r';
-        } else if (key === 'Backspace') {
-          sequence = '\u007f';
-        } else if (key === 'Tab') {
-          sequence = '\t';
-        } else if (key === 'Escape') {
-          sequence = '\u001b';
-        } else if (key === 'ArrowUp') {
-          sequence = '\u001b[A';
-        } else if (key === 'ArrowDown') {
-          sequence = '\u001b[B';
-        } else if (key === 'ArrowRight') {
-          sequence = '\u001b[C';
-        } else if (key === 'ArrowLeft') {
-          sequence = '\u001b[D';
-        } else if (key.length === 1 && !event.ctrlKey && !event.altKey) {
-          sequence = key;
-        }
-        if (!sequence) {
-          return;
-        }
-        event.preventDefault();
-        sendInput(sequence);
-      }
-
-      function openSession(id) {
-        if (!sessionById(id)) {
-          return;
-        }
-        state.active = id;
-        localStorage.setItem('pmp-terminal-active', id);
-        renderTabs();
-        setEmptyState();
-        clearTerminal();
-        terminalDecoder = new TextDecoder();
-        if (!ensureTerminal()) {
-          return;
-        }
-        attachSocket(id);
-        window.history.replaceState({}, '', '/terminal?session=' + encodeURIComponent(id));
-      }
-
-      window.createTerminalSession = function() {
-        fetch('/terminal/sessions', { method: 'POST' })
-          .then(function(response) { return response.json(); })
-          .then(function(session) {
-            state.sessions.unshift(session);
-            renderTabs();
-            openSession(session.id);
-          });
-      };
-
-      window.addEventListener('resize', resizeTerminal);
-      window.addEventListener('keydown', function(event) {
-        var isNewTab = (event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && String(event.key).toLowerCase() === 't';
-        if (!isNewTab) {
-          return;
-        }
-        event.preventDefault();
-        window.createTerminalSession();
-      });
-
-      setEmptyState();
-      renderTabs();
-      if (state.active) {
-        openSession(state.active);
-      } else if (state.sessions.length > 0) {
-        openSession(state.sessions[0].id);
-      } else {
-        window.createTerminalSession();
-      }
-    })();
-  </script>
-  ` + liveReloadScript + `
-</body>
-</html>`))
-
 var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -2664,16 +2035,6 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
       </form>
     </section>
   </main>
-  <script>
-    (function() {
-      var input = document.getElementById('new-prompt-title');
-      if (!input) {
-        return;
-      }
-      input.focus();
-      input.select();
-    })();
-  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))
@@ -2893,7 +2254,8 @@ var instructionsTemplate = template.Must(template.New("instructions").Parse(`<!d
           <h2 class="section-title">Instructions</h2>
           <div class="instructions">This text is stored in <code>INSTRUCTIONS.md</code> for the current project.</div>
           <div class="instructions">Keep it generic. It should explain how to use the compiled content, what the sections mean, and how response notes must be written back into <code>.pmp/responses/</code>.</div>
-          <div class="instructions">It is automatically prefixed onto every compilation before selected skills and prompts.</div>
+          <div class="instructions">It is automatically prefixed onto every compilation before memory, skills, and prompts.</div>
+          <div class="instructions">The memory section follows these instructions and contains project-specific context.</div>
         </div>
         <label class="label">
           <span>Instruction text</span>
@@ -2906,6 +2268,219 @@ var instructionsTemplate = template.Must(template.New("instructions").Parse(`<!d
     </section>
   </main>
   ` + liveReloadScript + `
+</body>
+</html>`))
+
+var memoryTemplate = template.Must(template.New("memory").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pmp memory</title>
+  <style>` + baseStyles + `</style>
+  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    .memory-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.7rem;
+      align-items: flex-start;
+    }
+    .memory-card {
+      flex: 0 1 19rem;
+      min-width: 16rem;
+    }
+    .memory-form {
+      margin-bottom: 1rem;
+    }
+    .memory-actions {
+      display: flex;
+      gap: 0.4rem;
+      margin-top: 0.5rem;
+    }
+    .memory-form textarea {
+      min-height: 8rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      ` + navBrand + `
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+    </nav>
+    ` + currentProjectBanner + `
+    <section class="panel">
+      <form id="memory-create-form" class="memory-form form-grid">
+        <div class="stack">
+          <h2 class="section-title">Add Memory</h2>
+          <div class="instructions">Add project-specific context that should be applied throughout all work.</div>
+        </div>
+        <label class="label">
+          <span>Title</span>
+          <input type="text" name="title" placeholder="Memory title" required>
+        </label>
+        <label class="label">
+          <span>Body</span>
+          <textarea name="body" placeholder="What should be remembered about this project?"></textarea>
+        </label>
+        <div class="actions spaced">
+          <button type="submit" class="primary">Add memory</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel compact">
+        <div>{{.TotalMemories}} memory items</div>
+        <div class="instructions">Memory items are stored in <code>.pmp/memory/</code>.</div>
+      </div>
+      <div class="memory-grid" id="memory-list">
+        {{range .Memories}}
+        <section class="panel memory-card">
+          <div class="prompt-card-copy">
+            <strong>{{.Title}}</strong>
+            <span class="small">{{.Timestamp}}</span>
+          </div>
+          <div class="memory-actions">
+            <button type="button" onclick="openMemoryModal('{{.ElementID}}')">View</button>
+            <button type="button" onclick="openEditModal('{{.ElementID}}')">Edit</button>
+            <button type="button" onclick="deleteMemory('{{.Path}}')" class="danger">Delete</button>
+          </div>
+          <div id="{{.ElementID}}-content" hidden>{{.HTMLBody}}</div>
+          <div id="{{.ElementID}}-title" hidden>{{.Title}}</div>
+          <div id="{{.ElementID}}-body" hidden>{{.Body}}</div>
+          <div id="{{.ElementID}}-path" hidden>{{.Path}}</div>
+          <dialog id="{{.ElementID}}" class="prompt-modal">
+            <div class="modal-shell">
+              <div class="modal-header">
+                <div>
+                  <div class="summary-title" id="{{.ElementID}}-modal-title"></div>
+                  <div class="summary-meta" id="{{.ElementID}}-modal-meta"></div>
+                </div>
+                <button type="button" onclick="closeMemoryModal('{{.ElementID}}')">Close</button>
+              </div>
+              <div class="modal-body" id="{{.ElementID}}-modal-body"></div>
+            </div>
+          </dialog>
+        </section>
+        {{else}}
+        <section class="panel">
+          <div class="muted">No memory items yet. Add one above.</div>
+        </section>
+        {{end}}
+      </div>
+    </section>
+  </main>
+  <dialog id="edit-memory-dialog" class="prompt-modal">
+    <div class="modal-shell">
+      <div class="modal-header">
+        <div>
+          <div class="summary-title">Edit Memory</div>
+        </div>
+        <button type="button" onclick="closeEditModal()">Cancel</button>
+      </div>
+      <div class="modal-body">
+        <form id="edit-memory-form" class="form-grid">
+          <input type="hidden" name="path" id="edit-memory-path">
+          <label class="label">
+            <span>Title</span>
+            <input type="text" name="title" id="edit-memory-title" required>
+          </label>
+          <label class="label">
+            <span>Body</span>
+            <textarea name="body" id="edit-memory-body"></textarea>
+          </label>
+          <div class="actions spaced">
+            <button type="submit" class="primary">Save changes</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </dialog>
+  ` + liveReloadScript + `
+  <script>
+    function openMemoryModal(id) {
+      var dialog = document.getElementById(id);
+      var body = document.getElementById(id + '-modal-body');
+      var title = document.getElementById(id + '-modal-title');
+      var content = document.getElementById(id + '-content');
+      var ts = document.getElementById(id + '-title');
+      var dateEl = document.getElementById(id + '-modal-meta');
+      if (!dialog || !body) return;
+      body.innerHTML = content ? content.innerHTML : '';
+      title.textContent = ts ? ts.textContent : '';
+      var views = document.querySelectorAll('[id^="' + id + '-modal-meta"]');
+      dateEl.textContent = '';
+      if (typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute('open', 'open');
+      }
+    }
+    function closeMemoryModal(id) {
+      var dialog = document.getElementById(id);
+      if (!dialog) return;
+      dialog.close();
+    }
+    function openEditModal(id) {
+      var dialog = document.getElementById('edit-memory-dialog');
+      var pathInput = document.getElementById('edit-memory-path');
+      var titleInput = document.getElementById('edit-memory-title');
+      var bodyInput = document.getElementById('edit-memory-body');
+      if (!dialog) return;
+      pathInput.value = document.getElementById(id + '-path').textContent;
+      titleInput.value = document.getElementById(id + '-title').textContent;
+      bodyInput.value = document.getElementById(id + '-body').textContent;
+      dialog.showModal();
+    }
+    function closeEditModal() {
+      var dialog = document.getElementById('edit-memory-dialog');
+      if (dialog) dialog.close();
+    }
+    function deleteMemory(path) {
+      if (!confirm('Delete this memory item?')) return;
+      var form = new FormData();
+      form.append('path', path);
+      fetch('/memory/api', { method: 'DELETE', body: form })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.error) { alert(data.error); return; }
+          location.reload();
+        });
+    }
+    document.getElementById('memory-create-form').onsubmit = function(e) {
+      e.preventDefault();
+      var form = new FormData(this);
+      var title = form.get('title');
+      if (!title || !title.trim()) {
+        alert('Title is required');
+        return;
+      }
+      fetch('/memory/api', { method: 'POST', body: form })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.error) { alert(data.error); return; }
+          location.reload();
+        })
+        .catch(function(err) { alert('Error: ' + err); });
+    };
+    document.getElementById('edit-memory-form').onsubmit = function(e) {
+      e.preventDefault();
+      var form = new FormData(this);
+      var title = form.get('title');
+      if (!title || !title.trim()) {
+        alert('Title is required');
+        return;
+      }
+      fetch('/memory/api', { method: 'PUT', body: form })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.error) { alert(data.error); return; }
+          location.reload();
+        })
+        .catch(function(err) { alert('Error: ' + err); });
+    };
+  </script>
 </body>
 </html>`))
 
@@ -3011,7 +2586,7 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
     ` + currentProjectBanner + `
     <section class="panel compact">
       <div>{{.TotalPrompts}} prompts{{if .HasMark}} · marked {{.MarkedIndex}}{{end}}</div>
-      <div class="instructions">Compile all prompts, from the mark, or an inclusive range.</div>
+      <div class="instructions">Compile all prompts, after the mark, or an inclusive range.</div>
     </section>
     {{if .Copied}}
     <section class="panel success">compiled to clipboard</section>
@@ -3039,7 +2614,7 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
         </div>
         <div class="actions">
           <button type="button" class="primary" onclick="startCompileAll()">Compile all</button>
-          <button type="button" onclick="startCompileFromMark()">Compile from mark</button>
+          <button type="button" onclick="startCompileFromMark()">Compile after mark</button>
           <button type="button" onclick="startCompileRange()">Compile range</button>
         </div>
       </div>

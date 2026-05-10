@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -114,7 +116,7 @@ func TestCompilePromptsAll(t *testing.T) {
 }
 
 func TestPrefixCompiledWithInstructions(t *testing.T) {
-	compiled := prefixCompiledWithInstructions("# Project\n\nFollow this", "<!-- prompt 0 -->\n# Prompt")
+	compiled := prefixCompiledWithInstructions("# Project\n\nFollow this", nil, "<!-- prompt 0 -->\n# Prompt")
 	if !strings.Contains(compiled, "<!-- INSTRUCTIONS SECTION -->") || !strings.Contains(compiled, "# Instructions Section") {
 		t.Fatalf("expected instructions section, got %q", compiled)
 	}
@@ -172,22 +174,28 @@ func TestCompilePromptIndexesSortsSelection(t *testing.T) {
 }
 
 func TestParseCompileArgs(t *testing.T) {
-	target, err := parseCompileArgs([]string{"0", "2", "./out.txt"})
+	target, err := parseCompileArgs([]string{"--range", "0", "2", "--output", "./out.txt", "--skills=ui-guidelines,another-skill", "--update-mark=false"})
 	if err != nil {
 		t.Fatalf("parseCompileArgs returned error: %v", err)
 	}
 	if target.Range == nil || target.Range.Start != 0 || target.Range.End != 2 {
 		t.Fatalf("unexpected compile range: %#v", target.Range)
 	}
+	if target.UpdateMark {
+		t.Fatalf("expected update mark to be disabled")
+	}
 	if target.OutputFile != "./out.txt" {
 		t.Fatalf("unexpected output file %q", target.OutputFile)
 	}
+	if len(target.IncludedSkills) != 2 || target.IncludedSkills[0] != "ui-guidelines" || target.IncludedSkills[1] != "another-skill" {
+		t.Fatalf("unexpected skills %#v", target.IncludedSkills)
+	}
 
-	target, err = parseCompileArgs([]string{"./out.txt"})
+	target, err = parseCompileArgs([]string{"--from-mark", "--stdout", "--skill", "ui-guidelines"})
 	if err != nil {
 		t.Fatalf("parseCompileArgs returned error: %v", err)
 	}
-	if target.OutputFile != "./out.txt" || target.Range != nil {
+	if !target.FromMark || !target.ToStdout || len(target.IncludedSkills) != 1 || target.IncludedSkills[0] != "ui-guidelines" {
 		t.Fatalf("unexpected target %#v", target)
 	}
 }
@@ -232,9 +240,14 @@ func TestCompilePromptIndexesIncludesOnlySelectedSkills(t *testing.T) {
 }
 
 func TestParseCompileArgsRejectsInvalidShape(t *testing.T) {
-	_, err := parseCompileArgs([]string{"0", "./out.txt"})
+	_, err := parseCompileArgs([]string{"--range", "0"})
 	if err == nil || !strings.Contains(err.Error(), "usage") {
 		t.Fatalf("expected usage error, got %v", err)
+	}
+
+	_, err = parseCompileArgs([]string{"--from-mark", "--range", "0", "1"})
+	if err == nil || !strings.Contains(err.Error(), "choose only one compile source") {
+		t.Fatalf("expected mutually exclusive source error, got %v", err)
 	}
 }
 
@@ -326,8 +339,11 @@ func TestCurrentMarkedIndexReturnsHighestIndex(t *testing.T) {
 	}
 }
 
-func TestIndexesForwardFromMark(t *testing.T) {
-	indexes := indexesForwardFromMark(8, map[int]bool{3: true})
+func TestIndexesFromMarkExclusive(t *testing.T) {
+	indexes, err := indexesFromMarkExclusive(8, map[int]bool{3: true})
+	if err != nil {
+		t.Fatalf("indexesFromMarkExclusive returned error: %v", err)
+	}
 	if len(indexes) != 4 {
 		t.Fatalf("expected 4 indexes, got %d", len(indexes))
 	}
@@ -336,15 +352,18 @@ func TestIndexesForwardFromMark(t *testing.T) {
 	}
 }
 
-func TestIndexesForwardFromMarkWithoutMark(t *testing.T) {
-	indexes := indexesForwardFromMark(8, map[int]bool{})
-	if indexes != nil {
-		t.Fatalf("expected nil indexes without mark, got %#v", indexes)
+func TestIndexesFromMarkExclusiveWithoutMark(t *testing.T) {
+	_, err := indexesFromMarkExclusive(8, map[int]bool{})
+	if err == nil || !strings.Contains(err.Error(), "no marked prompt") {
+		t.Fatalf("expected missing mark error, got %v", err)
 	}
 }
 
-func TestIndexesForwardFromMarkAtEnd(t *testing.T) {
-	indexes := indexesForwardFromMark(5, map[int]bool{4: true})
+func TestIndexesFromMarkExclusiveAtEnd(t *testing.T) {
+	indexes, err := indexesFromMarkExclusive(5, map[int]bool{4: true})
+	if err != nil {
+		t.Fatalf("indexesFromMarkExclusive returned error: %v", err)
+	}
 	if len(indexes) != 0 {
 		t.Fatalf("expected no indexes when mark is latest, got %#v", indexes)
 	}
@@ -1131,5 +1150,211 @@ func TestServeProjectCreateCreatesProjectUnderConfiguredRoot(t *testing.T) {
 	}
 	if filepath.Clean(root) != filepath.Clean(target) {
 		t.Fatalf("expected active project root %q, got %q", target, root)
+	}
+}
+
+func newMultipartRequest(t *testing.T, method string, target string, fields map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatalf("WriteField returned error: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(method, target, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	serveMemoryAPI(rec, req)
+	return rec
+}
+
+func TestServeMemoryAPIAcceptsMultipartPost(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	rec := newMultipartRequest(t, "POST", "/memory/api", map[string]string{
+		"title": "Decision",
+		"body":  "Keep memory submissions multipart-safe.",
+	})
+	if rec.Code != 201 {
+		t.Fatalf("expected created status, got %d with body %q", rec.Code, rec.Body.String())
+	}
+
+	memories, err := loadMemories()
+	if err != nil {
+		t.Fatalf("loadMemories returned error: %v", err)
+	}
+	if len(memories) != 1 || memories[0].Title != "Decision" {
+		t.Fatalf("unexpected memories %#v", memories)
+	}
+}
+
+func TestServeMemoryAPIAcceptsMultipartPut(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	path, err := saveMemory(Memory{
+		Title:     "Initial",
+		Timestamp: time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC),
+		Body:      "Before edit",
+	})
+	if err != nil {
+		t.Fatalf("saveMemory returned error: %v", err)
+	}
+
+	rec := newMultipartRequest(t, "PUT", "/memory/api", map[string]string{
+		"path":  path,
+		"title": "Updated",
+		"body":  "After edit",
+	})
+	if rec.Code != 200 {
+		t.Fatalf("expected ok status, got %d with body %q", rec.Code, rec.Body.String())
+	}
+
+	memories, err := loadMemories()
+	if err != nil {
+		t.Fatalf("loadMemories returned error: %v", err)
+	}
+	if len(memories) != 1 {
+		t.Fatalf("expected one memory after edit, got %#v", memories)
+	}
+	if memories[0].Title != "Updated" || memories[0].Body != "After edit" {
+		t.Fatalf("unexpected memory %#v", memories[0])
+	}
+}
+
+func TestServeNewPromptMarksFirstPromptWhenUnmarked(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/new", strings.NewReader(url.Values{
+		"title": {"First Prompt"},
+		"body":  {"This should create the initial mark."},
+	}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveNewPrompt(rec, req)
+
+	if rec.Code != 303 {
+		t.Fatalf("expected redirect status, got %d", rec.Code)
+	}
+
+	marks, err := loadMarks()
+	if err != nil {
+		t.Fatalf("loadMarks returned error: %v", err)
+	}
+	if len(marks) != 1 || !marks[0] {
+		t.Fatalf("expected first prompt to be marked, got %#v", marks)
+	}
+}
+
+func TestRunNewCommandSavesPromptAndMarksFirstPrompt(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	if err := runNewCommand([]string{"CLI Title", "CLI Body"}); err != nil {
+		t.Fatalf("runNewCommand returned error: %v", err)
+	}
+
+	prompts, err := loadPrompts()
+	if err != nil {
+		t.Fatalf("loadPrompts returned error: %v", err)
+	}
+	if len(prompts) != 1 || prompts[0].Title != "CLI Title" {
+		t.Fatalf("unexpected prompts %#v", prompts)
+	}
+
+	marks, err := loadMarks()
+	if err != nil {
+		t.Fatalf("loadMarks returned error: %v", err)
+	}
+	if len(marks) != 1 || !marks[0] {
+		t.Fatalf("expected first prompt to be marked, got %#v", marks)
+	}
+}
+
+func TestResolveCompileIndexesCLIFromMark(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	_, err := resolveCompileIndexesCLI(compileTarget{FromMark: true}, 5)
+	if err == nil || !strings.Contains(err.Error(), "no marked prompt") {
+		t.Fatalf("expected missing mark error, got %v", err)
 	}
 }
