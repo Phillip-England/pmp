@@ -10,6 +10,36 @@ import (
 
 const skillsDirName = "skills"
 
+var builtInSkills = []Skill{
+	{
+		Name: "pmp-compile-check",
+		Body: `# PMP Compile Check
+
+- Preserve chronological prompt order.
+- Keep memory before skills and prompts.
+- Prefer built-in instructions unless the compile explicitly excludes them.
+- Confirm the response note requirement still points at .pmp/responses/.`,
+	},
+	{
+		Name: "pmp-response-note",
+		Body: `# PMP Response Note
+
+- Write a new timestamped markdown file in .pmp/responses/.
+- Use YAML frontmatter with title and timestamp in RFC3339 format.
+- Include a matching top-level heading.
+- Keep the note short and record the main result, risk, blocker, or follow-up.`,
+	},
+	{
+		Name: "pmp-go-review",
+		Body: `# PMP Go Review
+
+- Keep changes small and file-based.
+- Prefer readable plain Go over indirection.
+- Update tests when behavior changes.
+- Preserve on-disk formats unless the feature explicitly changes them.`,
+	},
+}
+
 type Skill struct {
 	Name string
 	Body string
@@ -31,7 +61,25 @@ func ensureSkillsStorage() (string, error) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return "", err
 	}
+	if err := ensureBuiltInSkills(path); err != nil {
+		return "", err
+	}
 	return path, nil
+}
+
+func ensureBuiltInSkills(dir string) error {
+	for _, skill := range builtInSkills {
+		path := filepath.Join(dir, normalizeSkillName(skill.Name)+".md")
+		if _, err := os.Stat(path); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(skill.Body)+"\n"), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func normalizeSkillName(name string) string {

@@ -19,11 +19,10 @@ const (
 	memoryDirName                     = "memory"
 	draftFileName                     = "draft.md"
 	marksFileName                     = "marks.txt"
-	instructionsFileName              = "INSTRUCTIONS.md"
 	legacyProjectInstructionsFileName = "PROJECT.md"
 )
 
-const defaultInstructionsContents = `# Instructions
+const builtInInstructionsContents = `# Instructions
 
 You are receiving compiled prompt history from a Prompt Memory Project managed by ` + "`pmp`" + `.
 
@@ -173,14 +172,6 @@ func initProjectAtRoot(root string) error {
 	if _, err := ensureSkillsStorage(); err != nil {
 		return err
 	}
-	instructionsPath := filepath.Join(root, instructionsFileName)
-	if _, err := os.Stat(instructionsPath); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(instructionsPath, []byte(defaultInstructionsContents), 0o644); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
 	memoryPath := filepath.Join(base, memoryDirName)
 	if err := os.MkdirAll(memoryPath, 0o755); err != nil {
 		return err
@@ -234,14 +225,6 @@ func marksPath() (string, error) {
 	return filepath.Join(base, marksFileName), nil
 }
 
-func projectInstructionsPath() (string, error) {
-	root, err := projectRoot()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, instructionsFileName), nil
-}
-
 func legacyProjectInstructionsPath() (string, error) {
 	root, err := projectRoot()
 	if err != nil {
@@ -251,37 +234,18 @@ func legacyProjectInstructionsPath() (string, error) {
 }
 
 func loadProjectInstructions() (string, error) {
-	path, err := projectInstructionsPath()
-	if err != nil {
-		return "", err
-	}
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			legacyPath, legacyErr := legacyProjectInstructionsPath()
-			if legacyErr != nil {
-				return "", legacyErr
+	legacyPath, err := legacyProjectInstructionsPath()
+	if err == nil {
+		if legacyBytes, legacyReadErr := os.ReadFile(legacyPath); legacyReadErr == nil {
+			legacy := strings.TrimSpace(string(legacyBytes))
+			if legacy != "" {
+				return legacy, nil
 			}
-			legacyBytes, legacyReadErr := os.ReadFile(legacyPath)
-			if legacyReadErr != nil {
-				if errors.Is(legacyReadErr, os.ErrNotExist) {
-					return "", nil
-				}
-				return "", legacyReadErr
-			}
-			return string(legacyBytes), nil
+		} else if !errors.Is(legacyReadErr, os.ErrNotExist) {
+			return "", legacyReadErr
 		}
-		return "", err
 	}
-	return string(bytes), nil
-}
-
-func saveProjectInstructions(body string) error {
-	path, err := projectInstructionsPath()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(strings.TrimSpace(body)+"\n"), 0o644)
+	return builtInInstructionsContents, nil
 }
 
 func memoryDirPath() (string, error) {

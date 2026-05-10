@@ -11,7 +11,14 @@ import (
 const systemSettingsFileName = "settings.json"
 
 type ThemeSettings struct {
-	AccentColor string `json:"accent_color"`
+	AccentColor          string `json:"accent_color"`
+	SecondaryAccentColor string `json:"secondary_accent_color"`
+}
+
+type ThemePreset struct {
+	Name                 string
+	AccentColor          string
+	SecondaryAccentColor string
 }
 
 type ProjectSettings struct {
@@ -26,7 +33,23 @@ type SystemSettings struct {
 var hexColorPattern = regexp.MustCompile(`^#[0-9a-f]{6}$`)
 
 func defaultThemeSettings() ThemeSettings {
-	return ThemeSettings{AccentColor: "#8fd18a"}
+	return ThemeSettings{
+		AccentColor:          "#8fd18a",
+		SecondaryAccentColor: "#f3dd77",
+	}
+}
+
+func builtInThemePresets() []ThemePreset {
+	return []ThemePreset{
+		{Name: "Meadow", AccentColor: "#8fd18a", SecondaryAccentColor: "#f3dd77"},
+		{Name: "Signal", AccentColor: "#ff7a59", SecondaryAccentColor: "#ffd166"},
+		{Name: "Harbor", AccentColor: "#79c2d0", SecondaryAccentColor: "#f2aa33"},
+		{Name: "Ember", AccentColor: "#ff6b57", SecondaryAccentColor: "#ffb86b"},
+		{Name: "Volt", AccentColor: "#8ce35f", SecondaryAccentColor: "#f6f05d"},
+		{Name: "Rose", AccentColor: "#e889b5", SecondaryAccentColor: "#ffd27a"},
+		{Name: "Slate", AccentColor: "#9fb3c8", SecondaryAccentColor: "#e7c98f"},
+		{Name: "Ice", AccentColor: "#9ae6d6", SecondaryAccentColor: "#f7d794"},
+	}
 }
 
 func defaultSystemSettings() SystemSettings {
@@ -43,10 +66,14 @@ func defaultProjectSettings() ProjectSettings {
 func normalizeThemeSettings(settings ThemeSettings) ThemeSettings {
 	defaults := defaultThemeSettings()
 	settings.AccentColor = strings.TrimSpace(strings.ToLower(settings.AccentColor))
-	if hexColorPattern.MatchString(settings.AccentColor) {
-		return settings
+	settings.SecondaryAccentColor = strings.TrimSpace(strings.ToLower(settings.SecondaryAccentColor))
+	if !hexColorPattern.MatchString(settings.AccentColor) {
+		settings.AccentColor = defaults.AccentColor
 	}
-	return defaults
+	if !hexColorPattern.MatchString(settings.SecondaryAccentColor) {
+		settings.SecondaryAccentColor = defaults.SecondaryAccentColor
+	}
+	return settings
 }
 
 func defaultProjectScanRoots() []string {

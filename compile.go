@@ -19,16 +19,20 @@ type compileRange struct {
 }
 
 type compileTarget struct {
-	Range          *compileRange
-	FromMark       bool
-	OutputFile     string
-	IncludedSkills []string
-	UpdateMark     bool
-	ToStdout       bool
+	Range               *compileRange
+	FromMark            bool
+	OutputFile          string
+	IncludedSkills      []string
+	IncludeInstructions bool
+	UpdateMark          bool
+	ToStdout            bool
 }
 
 func parseCompileArgs(args []string) (compileTarget, error) {
-	target := compileTarget{UpdateMark: true}
+	target := compileTarget{
+		IncludeInstructions: true,
+		UpdateMark:          true,
+	}
 
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
@@ -75,6 +79,15 @@ func parseCompileArgs(args []string) (compileTarget, error) {
 			target.UpdateMark = parsed
 		case arg == "--update-mark":
 			target.UpdateMark = true
+		case strings.HasPrefix(arg, "--include-instructions="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--include-instructions="))
+			parsed, err := parseBoolFlag(value)
+			if err != nil {
+				return compileTarget{}, fmt.Errorf("invalid --include-instructions value %q", value)
+			}
+			target.IncludeInstructions = parsed
+		case arg == "--include-instructions":
+			target.IncludeInstructions = true
 		case arg == "--skill":
 			if i+1 >= len(args) {
 				return compileTarget{}, errors.New("usage: `pmp compile --skill <name>`")
@@ -200,7 +213,7 @@ func runCompile(target compileTarget) error {
 	if err != nil {
 		return err
 	}
-	compiled = prefixCompiledWithInstructions(projectInstructions, memories, compiled)
+	compiled = assembleCompiledDocument(projectInstructions, memories, compiled, target.IncludeInstructions)
 
 	if target.UpdateMark && len(selected) > 0 {
 		if err := markCompiledPrompt(selected); err != nil {
@@ -285,19 +298,28 @@ func renderSelectedSkills(skills []Skill, includedSkills []string) string {
 	return strings.Join(blocks, "\n\n")
 }
 
-func prefixCompiledWithInstructions(instructions string, memories []Memory, compiled string) string {
+func assembleCompiledDocument(instructions string, memories []Memory, compiled string, includeInstructions bool) string {
 	skills := extractCompileSection("Skills", compiled)
 	prompts := extractCompileSection("Prompts", compiled)
 	if skills == "" && prompts == "" {
 		prompts = compiled
 	}
+	if !includeInstructions {
+		instructions = ""
+	}
 	return renderCompileDocument(instructions, memories, skills, prompts)
+}
+
+func prefixCompiledWithInstructions(instructions string, memories []Memory, compiled string) string {
+	return assembleCompiledDocument(instructions, memories, compiled, true)
 }
 
 func renderCompileDocument(instructions string, memories []Memory, skills string, prompts string) string {
 	var b strings.Builder
-	writeCompileSection(&b, "Instructions", "Read this section first. It explains how to use the compiled material and how to write response notes back into the project.", instructions, "_No instructions provided._")
-	b.WriteString("\n\n")
+	if strings.TrimSpace(instructions) != "" {
+		writeCompileSection(&b, "Instructions", "Read this section first. It explains how to use the compiled material and how to write response notes back into the project.", instructions, "_No instructions provided._")
+		b.WriteString("\n\n")
+	}
 	b.WriteString("<!-- MEMORY SECTION -->\n")
 	b.WriteString("# Memory Section\n")
 	b.WriteString("This section contains project-specific context that should be applied throughout the work.\n\n")

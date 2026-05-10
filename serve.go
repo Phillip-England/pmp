@@ -34,7 +34,6 @@ type navItem struct {
 }
 
 type currentProjectData struct {
-	Name string
 	Path string
 }
 
@@ -51,52 +50,55 @@ type SkillToggle struct {
 }
 
 type newPromptPageData struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Error          string
-	Title          string
-	Body           string
-	Saved          bool
-	AccentColor    string
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Error                string
+	Title                string
+	Body                 string
+	Saved                bool
+	AccentColor          string
+	SecondaryAccentColor string
 }
 
 type skillsPageData struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Error          string
-	Saved          bool
-	Skills         []Skill
-	NewSkillName   string
-	NewSkillBody   string
-	AccentColor    string
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Error                string
+	Saved                bool
+	Skills               []Skill
+	NewSkillName         string
+	NewSkillBody         string
+	AccentColor          string
+	SecondaryAccentColor string
 }
 
 type settingsPageData struct {
-	Nav              []navItem
-	CurrentProject   currentProjectData
-	Error            string
-	Saved            bool
-	AccentColor      string
-	ProjectScanRoots string
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Error                string
+	Saved                bool
+	AccentColor          string
+	SecondaryAccentColor string
+	ProjectScanRoots     string
+	ThemePresets         []themePresetView
 }
 
-type instructionsPageData struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Error          string
-	Saved          bool
-	AccentColor    string
-	Body           string
+type themePresetView struct {
+	Name                 string
+	AccentColor          string
+	SecondaryAccentColor string
+	Selected             bool
 }
 
 type memoryPageData struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Error          string
-	Saved          bool
-	AccentColor    string
-	Memories       []MemoryView
-	TotalMemories  int
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Error                string
+	Saved                bool
+	AccentColor          string
+	SecondaryAccentColor string
+	Memories             []MemoryView
+	TotalMemories        int
 }
 
 type MemoryView struct {
@@ -112,23 +114,25 @@ type MemoryView struct {
 }
 
 type promptListPage struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Prompts        []PromptView
-	Skills         []SkillToggle
-	Copied         bool
-	TotalPrompts   int
-	AccentColor    string
-	MarkedIndex    int
-	HasMark        bool
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Prompts              []PromptView
+	Skills               []SkillToggle
+	Copied               bool
+	TotalPrompts         int
+	AccentColor          string
+	SecondaryAccentColor string
+	MarkedIndex          int
+	HasMark              bool
 }
 
 type responseListPage struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Responses      []PromptView
-	TotalResponses int
-	AccentColor    string
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Responses            []PromptView
+	TotalResponses       int
+	AccentColor          string
+	SecondaryAccentColor string
 }
 
 type PromptView struct {
@@ -155,16 +159,17 @@ type projectSnapshot struct {
 }
 
 type projectsPageData struct {
-	Nav            []navItem
-	CurrentProject currentProjectData
-	Projects       []projectListItem
-	ScanRoots      []string
-	AccentColor    string
-	Switched       bool
-	Created        bool
-	Error          string
-	NewProjectName string
-	NewProjectRoot string
+	Nav                  []navItem
+	CurrentProject       currentProjectData
+	Projects             []projectListItem
+	ScanRoots            []string
+	AccentColor          string
+	SecondaryAccentColor string
+	Switched             bool
+	Created              bool
+	Error                string
+	NewProjectName       string
+	NewProjectRoot       string
 }
 
 func newWebsocketHub() *websocketHub {
@@ -232,7 +237,6 @@ func runServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveHome)
 	mux.HandleFunc("/new", serveNewPrompt)
-	mux.HandleFunc("/instructions", serveInstructions)
 	mux.HandleFunc("/memory", serveMemory)
 	mux.HandleFunc("/memory/api", serveMemoryAPI)
 	mux.HandleFunc("/skills", serveSkills)
@@ -291,13 +295,14 @@ func serveProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := projectsPageData{
-		Nav:            buildNav("/projects"),
-		CurrentProject: currentProject,
-		Projects:       buildProjectListItems(projects, currentProject.Path),
-		ScanRoots:      systemSettings.Projects.ScanRoots,
-		AccentColor:    themeSettings.AccentColor,
-		Switched:       r.URL.Query().Get("switched") == "1",
-		Created:        r.URL.Query().Get("created") == "1",
+		Nav:                  buildNav("/projects"),
+		CurrentProject:       currentProject,
+		Projects:             buildProjectListItems(projects, currentProject.Path),
+		ScanRoots:            systemSettings.Projects.ScanRoots,
+		AccentColor:          themeSettings.AccentColor,
+		SecondaryAccentColor: themeSettings.SecondaryAccentColor,
+		Switched:             r.URL.Query().Get("switched") == "1",
+		Created:              r.URL.Query().Get("created") == "1",
 	}
 	renderTemplate(w, projectsTemplate, data)
 }
@@ -370,14 +375,15 @@ func serveProjectCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data := projectsPageData{
-			Nav:            buildNav("/projects"),
-			CurrentProject: currentProject,
-			Projects:       buildProjectListItems(projects, currentProject.Path),
-			ScanRoots:      systemSettings.Projects.ScanRoots,
-			AccentColor:    themeSettings.AccentColor,
-			Error:          err.Error(),
-			NewProjectName: name,
-			NewProjectRoot: root,
+			Nav:                  buildNav("/projects"),
+			CurrentProject:       currentProject,
+			Projects:             buildProjectListItems(projects, currentProject.Path),
+			ScanRoots:            systemSettings.Projects.ScanRoots,
+			AccentColor:          themeSettings.AccentColor,
+			SecondaryAccentColor: themeSettings.SecondaryAccentColor,
+			Error:                err.Error(),
+			NewProjectName:       name,
+			NewProjectRoot:       root,
 		}
 		renderTemplate(w, projectsTemplate, data)
 		return
@@ -416,6 +422,7 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 	data.Skills = buildSkillToggles(skills, nil)
 	data.TotalPrompts = len(prompts)
 	data.AccentColor = themeSettings.AccentColor
+	data.SecondaryAccentColor = themeSettings.SecondaryAccentColor
 	data.Copied = r.URL.Query().Get("copied") == "1"
 	data.MarkedIndex, data.HasMark = currentMarkedIndex(marks)
 
@@ -435,10 +442,11 @@ func serveResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	views := buildPromptViews(responses, nil)
 	data := responseListPage{
-		Nav:            buildNav("/responses"),
-		Responses:      views,
-		TotalResponses: len(responses),
-		AccentColor:    themeSettings.AccentColor,
+		Nav:                  buildNav("/responses"),
+		Responses:            views,
+		TotalResponses:       len(responses),
+		AccentColor:          themeSettings.AccentColor,
+		SecondaryAccentColor: themeSettings.SecondaryAccentColor,
 	}
 	data.CurrentProject, err = loadCurrentProjectData()
 	if err != nil {
@@ -518,7 +526,15 @@ func serveCompile(w http.ResponseWriter, r *http.Request) {
 		writeCompileJSON(w, "", err)
 		return
 	}
-	compiled = prefixCompiledWithInstructions(projectInstructions, memories, compiled)
+	includeInstructions := true
+	if raw := strings.TrimSpace(r.Form.Get("include_instructions")); raw != "" {
+		includeInstructions, err = parseBoolFlag(raw)
+		if err != nil {
+			writeCompileJSON(w, "", fmt.Errorf("invalid include_instructions value %q", raw))
+			return
+		}
+	}
+	compiled = assembleCompiledDocument(projectInstructions, memories, compiled, includeInstructions)
 	if shouldUpdateMark(r.Form) && len(selected) > 0 {
 		if err := markCompiledPrompt(selected); err != nil {
 			writeCompileJSON(w, "", err)
@@ -535,8 +551,9 @@ func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := newPromptPageData{
-		Nav:         buildNav("/new"),
-		AccentColor: systemSettings.Theme.AccentColor,
+		Nav:                  buildNav("/new"),
+		AccentColor:          systemSettings.Theme.AccentColor,
+		SecondaryAccentColor: systemSettings.Theme.SecondaryAccentColor,
 	}
 	data.CurrentProject, err = loadCurrentProjectData()
 	if err != nil {
@@ -590,9 +607,11 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := settingsPageData{
-		Nav:              buildNav("/settings"),
-		AccentColor:      systemSettings.Theme.AccentColor,
-		ProjectScanRoots: strings.Join(systemSettings.Projects.ScanRoots, "\n"),
+		Nav:                  buildNav("/settings"),
+		AccentColor:          systemSettings.Theme.AccentColor,
+		SecondaryAccentColor: systemSettings.Theme.SecondaryAccentColor,
+		ProjectScanRoots:     strings.Join(systemSettings.Projects.ScanRoots, "\n"),
+		ThemePresets:         buildThemePresetViews(systemSettings.Theme),
 	}
 	data.CurrentProject, err = loadCurrentProjectData()
 	if err != nil {
@@ -614,13 +633,16 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		systemSettings.Theme = normalizeThemeSettings(ThemeSettings{
-			AccentColor: r.Form.Get("accent_color"),
+			AccentColor:          r.Form.Get("accent_color"),
+			SecondaryAccentColor: r.Form.Get("secondary_accent_color"),
 		})
 		systemSettings.Projects = normalizeProjectSettings(ProjectSettings{
 			ScanRoots: strings.Split(r.Form.Get("project_scan_roots"), "\n"),
 		})
 		data.AccentColor = systemSettings.Theme.AccentColor
+		data.SecondaryAccentColor = systemSettings.Theme.SecondaryAccentColor
 		data.ProjectScanRoots = strings.Join(systemSettings.Projects.ScanRoots, "\n")
+		data.ThemePresets = buildThemePresetViews(systemSettings.Theme)
 		if err := saveSystemSettings(systemSettings); err != nil {
 			data.Error = err.Error()
 			renderTemplate(w, settingsTemplate, data)
@@ -634,53 +656,18 @@ func serveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func serveInstructions(w http.ResponseWriter, r *http.Request) {
-	themeSettings, err := loadThemeSettings()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+func buildThemePresetViews(theme ThemeSettings) []themePresetView {
+	presets := builtInThemePresets()
+	views := make([]themePresetView, 0, len(presets))
+	for _, preset := range presets {
+		views = append(views, themePresetView{
+			Name:                 preset.Name,
+			AccentColor:          preset.AccentColor,
+			SecondaryAccentColor: preset.SecondaryAccentColor,
+			Selected:             preset.AccentColor == theme.AccentColor && preset.SecondaryAccentColor == theme.SecondaryAccentColor,
+		})
 	}
-	body, err := loadProjectInstructions()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	data := instructionsPageData{
-		Nav:         buildNav("/instructions"),
-		AccentColor: themeSettings.AccentColor,
-		Body:        body,
-	}
-	data.CurrentProject, err = loadCurrentProjectData()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if r.URL.Query().Get("saved") == "1" {
-		data.Saved = true
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		renderTemplate(w, instructionsTemplate, data)
-		return
-	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			data.Error = err.Error()
-			renderTemplate(w, instructionsTemplate, data)
-			return
-		}
-		data.Body = r.Form.Get("body")
-		if err := saveProjectInstructions(data.Body); err != nil {
-			data.Error = err.Error()
-			renderTemplate(w, instructionsTemplate, data)
-			return
-		}
-		http.Redirect(w, r, "/instructions?saved=1", http.StatusSeeOther)
-		return
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	return views
 }
 
 func serveMemory(w http.ResponseWriter, r *http.Request) {
@@ -695,10 +682,11 @@ func serveMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := memoryPageData{
-		Nav:           buildNav("/memory"),
-		AccentColor:   themeSettings.AccentColor,
-		Memories:      buildMemoryViews(memories),
-		TotalMemories: len(memories),
+		Nav:                  buildNav("/memory"),
+		AccentColor:          themeSettings.AccentColor,
+		SecondaryAccentColor: themeSettings.SecondaryAccentColor,
+		Memories:             buildMemoryViews(memories),
+		TotalMemories:        len(memories),
 	}
 	data.CurrentProject, err = loadCurrentProjectData()
 	if err != nil {
@@ -828,9 +816,10 @@ func serveSkills(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := skillsPageData{
-		Nav:         buildNav("/skills"),
-		AccentColor: themeSettings.AccentColor,
-		Skills:      skills,
+		Nav:                  buildNav("/skills"),
+		AccentColor:          themeSettings.AccentColor,
+		SecondaryAccentColor: themeSettings.SecondaryAccentColor,
+		Skills:               skills,
 	}
 	data.CurrentProject, err = loadCurrentProjectData()
 	if err != nil {
@@ -1023,7 +1012,6 @@ func buildNav(current string) []navItem {
 	return []navItem{
 		{Label: "New", Href: "/new", Current: current == "/new"},
 		{Label: "Projects", Href: "/projects", Current: current == "/projects"},
-		{Label: "Instructions", Href: "/instructions", Current: current == "/instructions"},
 		{Label: "Memory", Href: "/memory", Current: current == "/memory"},
 		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
 		{Label: "Skills", Href: "/skills", Current: current == "/skills"},
@@ -1038,7 +1026,6 @@ func loadCurrentProjectData() (currentProjectData, error) {
 		return currentProjectData{}, err
 	}
 	return currentProjectData{
-		Name: projectName(root),
 		Path: root,
 	}, nil
 }
@@ -2057,8 +2044,6 @@ const liveReloadScript = `<script>
 const currentProjectBanner = `
     <section class="panel project-strip">
       <div class="project-strip-copy">
-        <div class="small project-strip-label">Working directory</div>
-        <div class="project-name">{{.CurrentProject.Name}}</div>
         <div class="instructions project-path">{{.CurrentProject.Path}}</div>
       </div>
     </section>`
@@ -2075,9 +2060,9 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>
@@ -2110,9 +2095,9 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>
@@ -2155,9 +2140,9 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>
@@ -2295,9 +2280,9 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>
@@ -2314,12 +2299,33 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
       <form method="post" class="form-grid">
         <div class="stack">
           <h2 class="section-title">Theme</h2>
-          <div class="instructions">Accent color is also system-wide.</div>
+          <div class="instructions">Accent colors are system-wide.</div>
         </div>
         <label class="label">
           <span>Accent color</span>
           <input type="color" name="accent_color" value="{{.AccentColor}}">
         </label>
+        <label class="label">
+          <span>Secondary accent color</span>
+          <input type="color" name="secondary_accent_color" value="{{.SecondaryAccentColor}}">
+        </label>
+        <div class="stack">
+          <h2 class="section-title">Preset Themes</h2>
+          <div class="instructions">Apply one of the built-in color pairs, then save if you want to keep it.</div>
+          <div class="skill-toggles">
+            {{range .ThemePresets}}
+            <button
+              type="button"
+              class="{{if .Selected}}primary{{end}}"
+              data-theme-preset="1"
+              data-theme-accent="{{.AccentColor}}"
+              data-theme-secondary="{{.SecondaryAccentColor}}"
+              onclick="applyThemePreset(this)">
+              {{.Name}}
+            </button>
+            {{end}}
+          </div>
+        </div>
         <div class="stack">
           <h2 class="section-title">Project Scan Roots</h2>
           <div class="instructions">PMP only scans these directories for projects. Keep this list small and focused.</div>
@@ -2337,63 +2343,55 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
 	  </main>
   <script>
     (function() {
-      var input = document.querySelector('input[name="accent_color"]');
-      if (!input) {
-        return;
+      var accentInput = document.querySelector('input[name="accent_color"]');
+      var secondaryInput = document.querySelector('input[name="secondary_accent_color"]');
+      function presetButtons() {
+        return Array.from(document.querySelectorAll('button[data-theme-preset]'));
       }
-      input.addEventListener('input', function(event) {
-        document.documentElement.style.setProperty('--action', event.currentTarget.value);
-      });
+      function syncThemePresetButtons() {
+        var accent = accentInput ? accentInput.value.toLowerCase() : '';
+        var secondary = secondaryInput ? secondaryInput.value.toLowerCase() : '';
+        presetButtons().forEach(function(button) {
+          var matches = (button.getAttribute('data-theme-accent') || '').toLowerCase() === accent
+            && (button.getAttribute('data-theme-secondary') || '').toLowerCase() === secondary;
+          button.classList.toggle('primary', matches);
+        });
+      }
+      if (accentInput) {
+        accentInput.addEventListener('input', function(event) {
+          document.documentElement.style.setProperty('--action', event.currentTarget.value);
+          syncThemePresetButtons();
+        });
+      }
+      if (secondaryInput) {
+        secondaryInput.addEventListener('input', function(event) {
+          document.documentElement.style.setProperty('--action-secondary', event.currentTarget.value);
+          document.documentElement.style.setProperty('--action-secondary-strong', event.currentTarget.value);
+          document.documentElement.style.setProperty('--action-secondary-glow', event.currentTarget.value);
+          syncThemePresetButtons();
+        });
+      }
+      window.applyThemePreset = function(button) {
+        if (!button) {
+          return;
+        }
+        var accent = button.getAttribute('data-theme-accent');
+        var secondary = button.getAttribute('data-theme-secondary');
+        if (accentInput && accent) {
+          accentInput.value = accent;
+          document.documentElement.style.setProperty('--action', accent);
+        }
+        if (secondaryInput && secondary) {
+          secondaryInput.value = secondary;
+          document.documentElement.style.setProperty('--action-secondary', secondary);
+          document.documentElement.style.setProperty('--action-secondary-strong', secondary);
+          document.documentElement.style.setProperty('--action-secondary-glow', secondary);
+        }
+        syncThemePresetButtons();
+      };
+      syncThemePresetButtons();
     })();
   </script>
-  ` + liveReloadScript + `
-</body>
-</html>`))
-
-var instructionsTemplate = template.Must(template.New("instructions").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pmp instructions</title>
-  <style>` + baseStyles + `</style>
-  <style>
-    :root {
-      --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
-    }
-  </style>
-</head>
-<body>
-  <main class="shell">
-    <nav class="nav">
-      ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
-    </nav>
-    ` + currentProjectBanner + `
-    {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
-    {{if .Saved}}<section class="panel success">saved</section>{{end}}
-    <section class="panel">
-      <form method="post" class="form-grid">
-        <div class="stack">
-          <h2 class="section-title">Instructions</h2>
-          <div class="instructions">This text is stored in <code>INSTRUCTIONS.md</code> for the current project.</div>
-          <div class="instructions">Keep it generic. It should explain how to use the compiled content, what the sections mean, and how response notes must be written back into <code>.pmp/responses/</code>.</div>
-          <div class="instructions">It is automatically prefixed onto every compilation before memory, skills, and prompts.</div>
-          <div class="instructions">The memory section follows these instructions and contains project-specific context.</div>
-        </div>
-        <label class="label">
-          <span>Instruction text</span>
-          <textarea name="body">{{.Body}}</textarea>
-        </label>
-        <div class="actions spaced">
-          <button type="submit" class="primary">Save instructions</button>
-        </div>
-      </form>
-    </section>
-  </main>
   ` + liveReloadScript + `
 </body>
 </html>`))
@@ -2408,9 +2406,9 @@ var memoryTemplate = template.Must(template.New("memory").Parse(`<!doctype html>
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
   <style>
@@ -2628,9 +2626,9 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>
@@ -2736,9 +2734,9 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>
@@ -2775,6 +2773,10 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
           <label class="compile-toggle">
             <input id="compile-update-mark" type="checkbox" checked>
             <span>Update mark after compile</span>
+          </label>
+          <label class="compile-toggle">
+            <input id="compile-include-instructions" type="checkbox" checked>
+            <span>Include built-in instructions</span>
           </label>
         </div>
         <div class="actions">
@@ -3091,6 +3093,8 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
         if (updateMark && updateMark.checked) {
           params.set('update_mark', '1');
         }
+        var includeInstructions = document.getElementById('compile-include-instructions');
+        params.set('include_instructions', includeInstructions && includeInstructions.checked ? 'true' : 'false');
         return params;
       }
       function startCompileAll() {
@@ -3137,9 +3141,9 @@ var projectsTemplate = template.Must(template.New("projects").Parse(`<!doctype h
   <style>
     :root {
       --action: {{.AccentColor}};
-      --action-secondary: #f3dd77;
-      --action-secondary-strong: #ffe995;
-      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+      --action-secondary: {{.SecondaryAccentColor}};
+      --action-secondary-strong: {{.SecondaryAccentColor}};
+      --action-secondary-glow: {{.SecondaryAccentColor}};
     }
   </style>
 </head>

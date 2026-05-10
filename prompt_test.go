@@ -203,7 +203,7 @@ func TestCompilePromptIndexesSortsSelection(t *testing.T) {
 }
 
 func TestParseCompileArgs(t *testing.T) {
-	target, err := parseCompileArgs([]string{"--range", "0", "2", "--output", "./out.txt", "--skills=ui-guidelines,another-skill", "--update-mark=false"})
+	target, err := parseCompileArgs([]string{"--range", "0", "2", "--output", "./out.txt", "--skills=ui-guidelines,another-skill", "--update-mark=false", "--include-instructions=false"})
 	if err != nil {
 		t.Fatalf("parseCompileArgs returned error: %v", err)
 	}
@@ -215,6 +215,9 @@ func TestParseCompileArgs(t *testing.T) {
 	}
 	if target.OutputFile != "./out.txt" {
 		t.Fatalf("unexpected output file %q", target.OutputFile)
+	}
+	if target.IncludeInstructions {
+		t.Fatalf("expected instructions to be excluded")
 	}
 	if len(target.IncludedSkills) != 2 || target.IncludedSkills[0] != "ui-guidelines" || target.IncludedSkills[1] != "another-skill" {
 		t.Fatalf("unexpected skills %#v", target.IncludedSkills)
@@ -453,7 +456,7 @@ func TestIndexesFromMarkExclusiveAtEnd(t *testing.T) {
 	}
 }
 
-func TestRunInitCreatesInstructionsFile(t *testing.T) {
+func TestRunInitDoesNotCreateInstructionsFile(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd returned error: %v", err)
@@ -470,17 +473,12 @@ func TestRunInitCreatesInstructionsFile(t *testing.T) {
 		t.Fatalf("runInit returned error: %v", err)
 	}
 
-	notePath := filepath.Join(tempDir, instructionsFileName)
-	note, err := os.ReadFile(notePath)
-	if err != nil {
-		t.Fatalf("ReadFile returned error: %v", err)
-	}
-	if !strings.Contains(string(note), ".pmp/responses/") || !strings.Contains(string(note), "Required Response Note") {
-		t.Fatalf("expected instructions contents, got %q", string(note))
+	if _, err := os.Stat(filepath.Join(tempDir, "INSTRUCTIONS.md")); !os.IsNotExist(err) {
+		t.Fatalf("expected no project instructions file, got %v", err)
 	}
 }
 
-func TestSaveAndLoadProjectInstructions(t *testing.T) {
+func TestLoadProjectInstructionsUsesBuiltInDefault(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd returned error: %v", err)
@@ -495,16 +493,41 @@ func TestSaveAndLoadProjectInstructions(t *testing.T) {
 
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
-	}
-	if err := saveProjectInstructions("# Instructions\n\nBe precise."); err != nil {
-		t.Fatalf("saveProjectInstructions returned error: %v", err)
 	}
 	body, err := loadProjectInstructions()
 	if err != nil {
 		t.Fatalf("loadProjectInstructions returned error: %v", err)
 	}
-	if !strings.Contains(body, "Be precise.") {
+	if !strings.Contains(body, "Required Response Note") || !strings.Contains(body, ".pmp/responses/") {
 		t.Fatalf("unexpected instructions body %q", body)
+	}
+}
+
+func TestLoadProjectInstructionsUsesLegacyProjectFile(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, legacyProjectInstructionsFileName), []byte("# Instructions\n\nLegacy text.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	body, err := loadProjectInstructions()
+	if err != nil {
+		t.Fatalf("loadProjectInstructions returned error: %v", err)
+	}
+	if !strings.Contains(body, "Legacy text.") {
+		t.Fatalf("expected legacy instructions, got %q", body)
 	}
 }
 
@@ -729,8 +752,8 @@ func TestLoadSkillsCreatesMissingDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSkills returned error: %v", err)
 	}
-	if len(skills) != 0 {
-		t.Fatalf("expected no skills, got %#v", skills)
+	if len(skills) != len(builtInSkills) {
+		t.Fatalf("expected built-in skills after recreation, got %#v", skills)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected recreated skills directory, got %v", err)
@@ -760,10 +783,14 @@ func TestSaveSkillPersistsAndLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSkills returned error: %v", err)
 	}
-	if len(skills) != 1 {
-		t.Fatalf("expected 1 skill, got %#v", skills)
+	found := false
+	for _, skill := range skills {
+		if skill.Name == "ui-guidelines" && strings.Contains(skill.Body, "Rules") {
+			found = true
+			break
+		}
 	}
-	if skills[0].Name != "ui-guidelines" || !strings.Contains(skills[0].Body, "Rules") {
+	if !found {
 		t.Fatalf("unexpected skills %#v", skills)
 	}
 }
@@ -1041,7 +1068,7 @@ func TestSaveThemeSettingsUpdatesSystemSettings(t *testing.T) {
 		_ = os.Unsetenv("PMP_CONFIG_HOME")
 	}()
 
-	if err := saveThemeSettings(ThemeSettings{AccentColor: "#79c2d0"}); err != nil {
+	if err := saveThemeSettings(ThemeSettings{AccentColor: "#79c2d0", SecondaryAccentColor: "#f2aa33"}); err != nil {
 		t.Fatalf("saveThemeSettings returned error: %v", err)
 	}
 
@@ -1049,8 +1076,30 @@ func TestSaveThemeSettingsUpdatesSystemSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadThemeSettings returned error: %v", err)
 	}
-	if theme.AccentColor != "#79c2d0" {
+	if theme.AccentColor != "#79c2d0" || theme.SecondaryAccentColor != "#f2aa33" {
 		t.Fatalf("unexpected theme %#v", theme)
+	}
+}
+
+func TestBuildThemePresetViewsMarksSelectedPreset(t *testing.T) {
+	views := buildThemePresetViews(ThemeSettings{
+		AccentColor:          "#79c2d0",
+		SecondaryAccentColor: "#f2aa33",
+	})
+	if len(views) < 5 {
+		t.Fatalf("expected several theme presets, got %#v", views)
+	}
+	selected := 0
+	for _, view := range views {
+		if view.Selected {
+			selected++
+			if view.Name != "Harbor" {
+				t.Fatalf("expected Harbor preset to be selected, got %#v", view)
+			}
+		}
+	}
+	if selected != 1 {
+		t.Fatalf("expected exactly one selected preset, got %#v", views)
 	}
 }
 
@@ -1070,7 +1119,7 @@ func TestWriteCompileJSONSuccess(t *testing.T) {
 	}
 }
 
-func TestServeCompilePrefixesProjectInstructions(t *testing.T) {
+func TestServeCompileIncludesBuiltInInstructionsByDefault(t *testing.T) {
 	configDir := t.TempDir()
 	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
 		t.Fatalf("Setenv returned error: %v", err)
@@ -1086,9 +1135,6 @@ func TestServeCompilePrefixesProjectInstructions(t *testing.T) {
 	}
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
-	}
-	if err := saveProjectInstructions("# Instructions\n\nAlways respect project context."); err != nil {
-		t.Fatalf("saveProjectInstructions returned error: %v", err)
 	}
 	if _, err := savePrompt(Prompt{
 		Title:     "Zero",
@@ -1113,8 +1159,53 @@ func TestServeCompilePrefixesProjectInstructions(t *testing.T) {
 	if !strings.Contains(payload["compiled"], "<!-- INSTRUCTIONS SECTION -->") || !strings.Contains(payload["compiled"], "<!-- PROMPTS SECTION -->") {
 		t.Fatalf("expected compile sections, got %q", payload["compiled"])
 	}
-	if !strings.Contains(payload["compiled"], "Always respect project context.") {
+	if !strings.Contains(payload["compiled"], "Required Response Note") {
 		t.Fatalf("expected instructions prefix, got %q", payload["compiled"])
+	}
+}
+
+func TestServeCompileCanExcludeInstructions(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "Zero",
+		Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+		Markdown:  "# Zero\n\nA\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/compile", strings.NewReader("prompt=0&include_instructions=false"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveCompile(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if strings.Contains(payload["compiled"], "<!-- INSTRUCTIONS SECTION -->") {
+		t.Fatalf("did not expect instructions section, got %q", payload["compiled"])
+	}
+	if !strings.Contains(payload["compiled"], "<!-- MEMORY SECTION -->") {
+		t.Fatalf("expected memory section, got %q", payload["compiled"])
 	}
 }
 

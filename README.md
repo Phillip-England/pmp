@@ -7,12 +7,12 @@ It stores prompts as markdown files, keeps lightweight project memory alongside 
 ## What It Does
 
 - Tracks prompts in `.pmp/prompts/` as timestamped markdown files with YAML frontmatter
-- Keeps project instructions in root `INSTRUCTIONS.md`
+- Uses built-in compile instructions by default
 - Stores reusable project memory in `.pmp/memory/`
 - Stores response notes in `.pmp/responses/`
 - Lets you mark a prompt and compile from that mark forward
 - Supports a focused CLI for fast operations
-- Provides a local web UI for browsing, editing project context, and compiling history
+- Provides a local web UI for browsing project context and compiling history
 
 ## Philosophy
 
@@ -89,12 +89,10 @@ your-project/
 │   ├── memory/
 │   ├── prompts/
 │   └── responses/
-└── INSTRUCTIONS.md
 ```
 
 What each part is for:
 
-- `INSTRUCTIONS.md`: generic instructions prepended to compilations
 - `.pmp/prompts/`: chronological prompt history
 - `.pmp/memory/`: durable project context that should apply across prompts
 - `.pmp/responses/`: response notes written after important work completes
@@ -174,6 +172,7 @@ Useful flags:
 - `--range <start> <end>`: compile an inclusive prompt range
 - `--skill <name>`: include a named skill
 - `--skills name-a,name-b`: include multiple skills
+- `--include-instructions=false`: omit the built-in instructions section
 - `--update-mark=false`: do not move the mark after compile
 
 Examples:
@@ -183,6 +182,7 @@ pmp compile --stdout
 pmp compile --from-mark --stdout
 pmp compile --range 4 9 --output ./compiled.md
 pmp compile --from-mark --skill ui-notes --skill release-checklist --stdout
+pmp compile --stdout --include-instructions=false
 ```
 
 ## How Marking Works
@@ -222,17 +222,6 @@ It supports:
 
 When you compile from the UI, the result is copied to the clipboard.
 
-### Instructions
-
-Edits the project’s `INSTRUCTIONS.md`.
-
-This file is not general product documentation. It tells the downstream model:
-
-- what the compiled material is
-- how to read the sections
-- how to use memory and selected skills
-- that it must write at least one response note into `.pmp/responses/`
-
 ### Memory
 
 Stores persistent project-specific context in `.pmp/memory/`.
@@ -250,7 +239,7 @@ Memory is included in compiled output ahead of skills and prompts.
 
 Stores optional reusable skill documents in the user config area, not in the project directory.
 
-Skills are opt-in during compilation. They are useful for reusable guidance such as:
+Skills are opt-in during compilation. PMP also seeds a few built-in defaults. They are useful for reusable guidance such as:
 
 - coding conventions
 - deployment checklists
@@ -274,6 +263,8 @@ Project discovery uses configurable scan roots plus a local registry of opened p
 Current settings include:
 
 - accent color
+- secondary accent color
+- built-in theme presets
 - project scan roots
 
 Settings are stored in the user config directory.
@@ -331,7 +322,7 @@ Not every action belongs in the terminal.
 The current split is deliberate:
 
 - CLI: quick prompt capture, listing, marking, deleting, compiling
-- Web UI: browsing, filtering, project context editing, memory management, skill selection, responses, settings, multi-project navigation
+- Web UI: browsing, filtering, memory management, skill selection, responses, settings, multi-project navigation
 
 That keeps the command surface practical while preserving a better interface for context-heavy tasks.
 

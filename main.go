@@ -70,5 +70,15 @@ Usage:
   pmp unmark  Remove prompt marks
   pmp delete  Delete prompts by index or inclusive range
   pmp remove  Remove one prompt, response, skill, or memory
-  pmp compile Compile prompt history from the CLI`)
+  pmp compile Compile prompt history from the CLI
+
+Compile flags:
+  --from-mark
+  --range <start> <end>
+  --stdout
+  --output <file>
+  --skill <name>
+  --skills <name-a,name-b>
+  --include-instructions=false
+  --update-mark=false`)
 }
