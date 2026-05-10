@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,34 @@ import (
 	"testing"
 	"time"
 )
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	original := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe returned error: %v", err)
+	}
+	os.Stdout = w
+	defer func() {
+		os.Stdout = original
+	}()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	return string(output)
+}
 
 func TestParseDraftRequiresTitleAndBody(t *testing.T) {
 	_, err := parseDraft("plain text only")
@@ -336,6 +365,61 @@ func TestCurrentMarkedIndexReturnsHighestIndex(t *testing.T) {
 	index, ok := currentMarkedIndex(map[int]bool{2: true, 5: true})
 	if !ok || index != 5 {
 		t.Fatalf("expected highest marked index 5, got %d %v", index, ok)
+	}
+}
+
+func TestRunMarkReplacesExistingMarks(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "Zero",
+		Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+		Markdown:  "# Zero\n\nA\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "One",
+		Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC),
+		Markdown:  "# One\n\nB\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+	if err := saveMarks(map[int]bool{0: true}); err != nil {
+		t.Fatalf("saveMarks returned error: %v", err)
+	}
+
+	if err := runMark([]string{"1"}); err != nil {
+		t.Fatalf("runMark returned error: %v", err)
+	}
+
+	marks, err := loadMarks()
+	if err != nil {
+		t.Fatalf("loadMarks returned error: %v", err)
+	}
+	if len(marks) != 1 || !marks[1] {
+		t.Fatalf("expected only prompt 1 to remain marked, got %#v", marks)
+	}
+}
+
+func TestRunMarkRejectsMultipleIndexes(t *testing.T) {
+	err := runMark([]string{"1", "2"})
+	if err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("expected usage error, got %v", err)
 	}
 }
 
@@ -684,6 +768,224 @@ func TestSaveSkillPersistsAndLoads(t *testing.T) {
 	}
 }
 
+func TestRunAddSkillRejectsDuplicateName(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if err := runAddSkill([]string{"ui-guidelines", "# UI\n\nRules"}); err != nil {
+		t.Fatalf("runAddSkill returned error: %v", err)
+	}
+	err = runAddSkill([]string{"ui-guidelines", "# UI\n\nMore"})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected duplicate error, got %v", err)
+	}
+}
+
+func TestRunAddMemoryAndPrintMemory(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	if err := runAddMemory([]string{"Team Norms", "Prefer short notes."}); err != nil {
+		t.Fatalf("runAddMemory returned error: %v", err)
+	}
+	output := captureStdout(t, func() {
+		if err := runPrintMemory([]string{"team-norms"}); err != nil {
+			t.Fatalf("runPrintMemory returned error: %v", err)
+		}
+	})
+	if !strings.Contains(output, "# Team Norms") || !strings.Contains(output, "Prefer short notes.") {
+		t.Fatalf("unexpected output %q", output)
+	}
+}
+
+func TestRunRemoveMemoryDeletesByNormalizedTitle(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	path, err := saveMemory(Memory{
+		Title:     "Decision Log",
+		Timestamp: time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC),
+		Body:      "Keep it simple.",
+	})
+	if err != nil {
+		t.Fatalf("saveMemory returned error: %v", err)
+	}
+
+	if err := runRemoveMemory([]string{"decision-log"}); err != nil {
+		t.Fatalf("runRemoveMemory returned error: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected memory file to be removed, got %v", err)
+	}
+}
+
+func TestRunPrintPromptByIndex(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "First",
+		Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+		Markdown:  "# First\n\nAlpha\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := runPrintPrompt([]string{"0"}); err != nil {
+			t.Fatalf("runPrintPrompt returned error: %v", err)
+		}
+	})
+	if !strings.Contains(output, "# First") || !strings.Contains(output, "Alpha") {
+		t.Fatalf("unexpected output %q", output)
+	}
+}
+
+func TestRunListCommandListsSkills(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(wd)
+	}()
+
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if err := saveSkill("ui-guidelines", "# UI\n\nRules"); err != nil {
+		t.Fatalf("saveSkill returned error: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := runListCommand([]string{"skills"}); err != nil {
+			t.Fatalf("runListCommand returned error: %v", err)
+		}
+	})
+	if !strings.Contains(output, "[ui-guidelines]") {
+		t.Fatalf("unexpected output %q", output)
+	}
+}
+
+func TestRunListPrintsPromptsOldestFirst(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "Older",
+		Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+		Markdown:  "# Older\n\nFirst\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+	if _, err := savePrompt(Prompt{
+		Title:     "Newer",
+		Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC),
+		Markdown:  "# Newer\n\nSecond\n",
+	}); err != nil {
+		t.Fatalf("savePrompt returned error: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := runList(); err != nil {
+			t.Fatalf("runList returned error: %v", err)
+		}
+	})
+	olderIndex := strings.Index(output, "Older")
+	newerIndex := strings.Index(output, "Newer")
+	if olderIndex == -1 || newerIndex == -1 {
+		t.Fatalf("expected both prompts in output, got %q", output)
+	}
+	if olderIndex > newerIndex {
+		t.Fatalf("expected oldest prompt before newest prompt, got %q", output)
+	}
+}
+
 func TestLoadSystemSettingsCreatesDefaultFile(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -851,6 +1153,135 @@ func TestLoadResponsesReadsResponseNotes(t *testing.T) {
 	}
 }
 
+func TestRunRemoveResponseDeletesByIndex(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, responsesDirName)
+	response := Prompt{
+		Title:     "Model Response",
+		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
+		Markdown:  "# Model Response\n\nImportant result.\n",
+	}
+	path := filepath.Join(responseDir, "20260508T120500Z-model-response.md")
+	if err := os.WriteFile(path, []byte(formatPromptFile(response)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	if err := runRemoveResponse([]string{"0"}); err != nil {
+		t.Fatalf("runRemoveResponse returned error: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected response file to be removed, got %v", err)
+	}
+}
+
+func TestServeDeleteResponseRemovesResponse(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, responsesDirName)
+	first := Prompt{Title: "Older", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Older\n\nA\n"}
+	second := Prompt{Title: "Newer", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# Newer\n\nB\n"}
+	if err := os.WriteFile(filepath.Join(responseDir, "20260508T120000Z-older.md"), []byte(formatPromptFile(first)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(responseDir, "20260508T120100Z-newer.md"), []byte(formatPromptFile(second)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/responses/delete", strings.NewReader("delete_response=1"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveDeleteResponse(rec, req)
+
+	if rec.Code != 303 {
+		t.Fatalf("expected redirect status, got %d", rec.Code)
+	}
+	if location := rec.Header().Get("Location"); location != "/responses" {
+		t.Fatalf("unexpected redirect location %q", location)
+	}
+	responses, err := loadResponses()
+	if err != nil {
+		t.Fatalf("loadResponses returned error: %v", err)
+	}
+	if len(responses) != 1 || responses[0].Title != "Older" {
+		t.Fatalf("unexpected responses %#v", responses)
+	}
+}
+
+func TestServeResponsesUsesCardClickWithoutViewButton(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, responsesDirName)
+	response := Prompt{
+		Title:     "Model Response",
+		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
+		Markdown:  "# Model Response\n\nImportant result.\n",
+	}
+	if err := os.WriteFile(filepath.Join(responseDir, "20260508T120500Z-model-response.md"), []byte(formatPromptFile(response)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/responses", nil)
+	serveResponses(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `onclick="openResponseModal('prompt-0')"`) {
+		t.Fatalf("expected card click handler in response page, got %q", body)
+	}
+	if !strings.Contains(body, ".prompt-card.clickable-card:hover") || !strings.Contains(body, "cursor: pointer;") {
+		t.Fatalf("expected clickable hover styling in response page, got %q", body)
+	}
+	if strings.Contains(body, ">View<") {
+		t.Fatalf("did not expect view button in response page, got %q", body)
+	}
+}
+
 func TestWriteCompileJSONError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeCompileJSON(rec, "", os.ErrInvalid)
@@ -933,7 +1364,7 @@ func TestServeProjectSwitchUpdatesActiveProject(t *testing.T) {
 	if rec.Code != 303 {
 		t.Fatalf("expected redirect status, got %d", rec.Code)
 	}
-	if location := rec.Header().Get("Location"); location != "/projects?switched=1" {
+	if location := rec.Header().Get("Location"); location != "/new" {
 		t.Fatalf("unexpected redirect location %q", location)
 	}
 	root, err := projectRoot()

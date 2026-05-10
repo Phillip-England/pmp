@@ -68,36 +68,32 @@ func saveMarks(marks map[int]bool) error {
 
 func runMark(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: `pmp mark <index> [<index> ...]` or `pmp mark clear`")
+		return fmt.Errorf("usage: `pmp mark <index>` or `pmp mark clear`")
 	}
 	if len(args) == 1 && args[0] == "clear" {
 		return clearMarks()
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: `pmp mark <index>` or `pmp mark clear`")
 	}
 
 	prompts, err := loadPrompts()
 	if err != nil {
 		return err
 	}
-	marks, err := loadMarks()
+
+	index, err := strconv.Atoi(args[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid mark index %q", args[0])
+	}
+	if index < 0 || index >= len(prompts) {
+		return fmt.Errorf("mark index %d is out of bounds; highest prompt index is %d", index, len(prompts)-1)
 	}
 
-	for _, arg := range args {
-		index, err := strconv.Atoi(arg)
-		if err != nil {
-			return fmt.Errorf("invalid mark index %q", arg)
-		}
-		if index < 0 || index >= len(prompts) {
-			return fmt.Errorf("mark index %d is out of bounds; highest prompt index is %d", index, len(prompts)-1)
-		}
-		marks[index] = true
-	}
-
-	if err := saveMarks(marks); err != nil {
+	if err := saveMarks(map[int]bool{index: true}); err != nil {
 		return err
 	}
-	fmt.Println("marks updated")
+	fmt.Printf("marked prompt %d\n", index)
 	return nil
 }
 

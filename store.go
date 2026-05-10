@@ -198,7 +198,7 @@ func runList() error {
 		return nil
 	}
 
-	for i := len(prompts) - 1; i >= 0; i-- {
+	for i := 0; i < len(prompts); i++ {
 		prompt := prompts[i]
 		indexLabel := fmt.Sprintf("[%d]", i)
 		if marks[i] {

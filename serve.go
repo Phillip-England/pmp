@@ -141,6 +141,7 @@ type PromptView struct {
 	ElementID  string
 	Marked     bool
 	Checked    bool
+	Path       string
 }
 
 type websocketHub struct {
@@ -238,6 +239,7 @@ func runServe() error {
 	mux.HandleFunc("/settings", serveSettings)
 	mux.HandleFunc("/prompts", servePrompts)
 	mux.HandleFunc("/responses", serveResponses)
+	mux.HandleFunc("/responses/delete", serveDeleteResponse)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
 	mux.HandleFunc("/projects", serveProjects)
 	mux.HandleFunc("/projects/switch", serveProjectSwitch)
@@ -327,7 +329,7 @@ func serveProjectSwitch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/projects?switched=1", http.StatusSeeOther)
+	http.Redirect(w, r, "/new", http.StatusSeeOther)
 }
 
 func serveProjectCreate(w http.ResponseWriter, r *http.Request) {
@@ -444,6 +446,32 @@ func serveResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	renderTemplate(w, responsesTemplate, data)
+}
+
+func serveDeleteResponse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	indexValue := strings.TrimSpace(r.Form.Get("delete_response"))
+	if indexValue == "" {
+		http.Error(w, "missing response index", http.StatusBadRequest)
+		return
+	}
+	response, _, err := responseByIndexArg(indexValue)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := os.Remove(response.Path); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/responses", http.StatusSeeOther)
 }
 
 func serveCompile(w http.ResponseWriter, r *http.Request) {
@@ -1097,6 +1125,7 @@ func buildPromptViews(prompts []Prompt, marks map[int]bool) []PromptView {
 			ElementID:  fmt.Sprintf("prompt-%d", index),
 			Marked:     marked,
 			Checked:    false,
+			Path:       prompt.Path,
 		})
 	}
 	return views
@@ -1448,6 +1477,9 @@ const baseStyles = `
     --muted: #a6a6a6;
     --accent: #ffffff;
     --action: #8fd18a;
+    --action-secondary: #f3dd77;
+    --action-secondary-strong: #ffe995;
+    --action-secondary-glow: rgba(243, 221, 119, 0.26);
     --mark-bg: #1a1a1a;
     --mark-border: #ffffff;
   }
@@ -1544,13 +1576,44 @@ const baseStyles = `
   .project-strip {
     margin-bottom: 0.75rem;
     align-items: flex-start;
+    padding: 0.95rem 1rem;
+    border-color: color-mix(in srgb, var(--action-secondary) 42%, var(--border));
+    background:
+      linear-gradient(135deg, color-mix(in srgb, var(--action-secondary) 12%, transparent), transparent 55%),
+      var(--panel);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--action-secondary) 14%, transparent),
+      0 1rem 2.5rem rgba(0, 0, 0, 0.22);
+  }
+  .project-strip-label {
+    color: color-mix(in srgb, var(--action-secondary) 76%, white);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .project-strip-copy {
+    display: grid;
+    gap: 0.28rem;
   }
   .project-name {
     font-size: 1rem;
     text-transform: uppercase;
+    color: var(--action-secondary-strong);
+    text-shadow: 0 0 1.1rem color-mix(in srgb, var(--action-secondary) 22%, transparent);
   }
   .project-path {
     word-break: break-word;
+    color: color-mix(in srgb, var(--action-secondary) 68%, white);
+  }
+  .project-strip .project-path {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    max-width: 100%;
+    padding: 0.35rem 0.55rem;
+    border: 1px solid color-mix(in srgb, var(--action-secondary) 34%, var(--border));
+    border-radius: 0.55rem;
+    background: color-mix(in srgb, var(--action-secondary) 8%, #050505);
+    box-shadow: 0 0 1.2rem var(--action-secondary-glow);
   }
   .muted {
     color: var(--muted);
@@ -1651,11 +1714,13 @@ const baseStyles = `
     display: inline-block;
     margin-left: 0.45rem;
     padding: 0.05rem 0.35rem;
-    border: 1px solid #ffffff;
+    border: 1px solid var(--action-secondary);
     border-radius: 999px;
     font-size: 0.72rem;
     line-height: 1.3;
     vertical-align: middle;
+    color: var(--action-secondary-strong);
+    background: color-mix(in srgb, var(--action-secondary) 10%, transparent);
   }
   article {
     margin-top: 0.7rem;
@@ -1849,9 +1914,28 @@ const baseStyles = `
     flex: 0 1 18rem;
     min-width: 15rem;
   }
+  .prompt-card.clickable-card {
+    cursor: pointer;
+    transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+  }
+  .prompt-card.clickable-card:hover,
+  .prompt-card.clickable-card:focus-visible,
+  .prompt-card.clickable-card:focus-within {
+    transform: translateY(-2px);
+    border-color: var(--action-secondary);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--action-secondary) 42%, transparent),
+      0 0.8rem 1.8rem rgba(0, 0, 0, 0.24);
+    background: color-mix(in srgb, var(--action-secondary) 6%, var(--panel));
+  }
   .prompt-card.marked {
     border-color: var(--mark-border);
     background: var(--mark-bg);
+  }
+  .prompt-card.clickable-card.marked:hover,
+  .prompt-card.clickable-card.marked:focus-visible,
+  .prompt-card.clickable-card.marked:focus-within {
+    border-color: var(--action-secondary);
   }
   .prompt-card-header {
     display: flex;
@@ -1861,6 +1945,10 @@ const baseStyles = `
   .prompt-card-copy {
     display: grid;
     gap: 0.18rem;
+  }
+  .prompt-card-copy strong,
+  .summary-title {
+    color: color-mix(in srgb, var(--action-secondary) 52%, white);
   }
   .skill-toggles {
     display: flex;
@@ -1968,7 +2056,11 @@ const liveReloadScript = `<script>
 
 const currentProjectBanner = `
     <section class="panel project-strip">
-      <div class="small">Working directory: <span class="project-name">{{.CurrentProject.Name}}</span></div>
+      <div class="project-strip-copy">
+        <div class="small project-strip-label">Working directory</div>
+        <div class="project-name">{{.CurrentProject.Name}}</div>
+        <div class="instructions project-path">{{.CurrentProject.Path}}</div>
+      </div>
     </section>`
 
 const navBrand = `<div class="nav-brand">pmp</div>`
@@ -1980,7 +2072,14 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2008,7 +2107,14 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp new</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2046,7 +2152,14 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp skills</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2179,7 +2292,14 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp settings</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2237,7 +2357,14 @@ var instructionsTemplate = template.Must(template.New("instructions").Parse(`<!d
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp instructions</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2278,7 +2405,14 @@ var memoryTemplate = template.Must(template.New("memory").Parse(`<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp memory</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
   <style>
     .memory-grid {
       display: flex;
@@ -2491,7 +2625,14 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp responses</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2507,13 +2648,10 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
     <section class="panel stack">
       <div class="prompt-grid">
         {{range .Responses}}
-        <section class="prompt-card" data-date="{{.DateValue}}">
+        <section class="prompt-card response-card clickable-card" data-date="{{.DateValue}}" tabindex="0" role="button" aria-label="Open response {{.Title}}" onclick="openResponseModal('{{.ElementID}}')" onkeydown="activateCardModal(event, '{{.ElementID}}', openResponseModal)">
           <div class="prompt-card-copy">
             <strong>{{.Title}}</strong>
             <span class="small">{{.Timestamp}}</span>
-          </div>
-          <div class="actions">
-            <button type="button" onclick="openResponseModal('{{.ElementID}}')">View</button>
           </div>
           <div id="{{.ElementID}}-content" hidden>{{.HTMLBody}}</div>
           <dialog id="{{.ElementID}}" class="prompt-modal">
@@ -2523,9 +2661,15 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
                   <div class="summary-title">{{.Title}}</div>
                   <div class="summary-meta">{{.Timestamp}}</div>
                 </div>
-                <button type="button" onclick="closeResponseModal('{{.ElementID}}')">Close</button>
+                <button type="button" onclick="event.stopPropagation(); closeResponseModal('{{.ElementID}}')">Close</button>
               </div>
               <div class="modal-body" id="{{.ElementID}}-body"></div>
+              <div class="prompt-actions">
+                <form method="post" action="/responses/delete" onclick="event.stopPropagation()">
+                  <input type="hidden" name="delete_response" value="{{.Index}}">
+                  <button type="submit" class="danger">Delete</button>
+                </form>
+              </div>
             </div>
           </dialog>
         </section>
@@ -2538,6 +2682,15 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
     </section>
   </main>
   <script>
+    function activateCardModal(event, id, opener) {
+      if (!event || !opener) {
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        opener(id);
+      }
+    }
     function openResponseModal(id) {
       var dialog = document.getElementById(id);
       var body = document.getElementById(id + '-body');
@@ -2563,6 +2716,11 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
         dialog.removeAttribute('open');
       }
     }
+    document.addEventListener('click', function(event) {
+      if (event.target && event.target.tagName === 'DIALOG') {
+        event.target.close();
+      }
+    });
   </script>
   ` + liveReloadScript + `
 </body>
@@ -2575,7 +2733,14 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp prompts</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
@@ -2642,13 +2807,10 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
     <section class="panel stack">
         <div class="prompt-grid" {{if .HasMark}}data-marked-index="{{.MarkedIndex}}"{{end}}>
           {{range .Prompts}}
-          <section class="prompt-card {{if .Marked}}marked{{end}}" data-search="{{.SearchText}}" data-date="{{.DateValue}}">
+          <section class="prompt-card clickable-card {{if .Marked}}marked{{end}}" data-search="{{.SearchText}}" data-date="{{.DateValue}}" tabindex="0" role="button" aria-label="Open prompt {{.Title}}" onclick="openPromptModal('{{.ElementID}}')" onkeydown="activateCardModal(event, '{{.ElementID}}', openPromptModal)">
             <div class="prompt-card-copy">
               <strong>{{.Title}}</strong>{{if .Marked}} <span class="mark-badge">marked</span>{{end}}
               <span class="small">#{{.Index}} · {{.Timestamp}}</span>
-            </div>
-            <div class="actions">
-              <button type="button" onclick="openPromptModal('{{.ElementID}}')">View</button>
             </div>
             <div id="{{.ElementID}}-content" hidden>{{.HTMLBody}}</div>
             <dialog id="{{.ElementID}}" class="prompt-modal">
@@ -2706,6 +2868,15 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
   </main>
   <script>
     var pendingCompileRequest = null;
+    function activateCardModal(event, id, opener) {
+      if (!event || !opener) {
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        opener(id);
+      }
+    }
     function compileSkillDialog() {
       return document.getElementById('compile-skill-modal');
     }
@@ -2963,7 +3134,14 @@ var projectsTemplate = template.Must(template.New("projects").Parse(`<!doctype h
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pmp projects</title>
   <style>` + baseStyles + `</style>
-  <style>:root { --action: {{.AccentColor}}; }</style>
+  <style>
+    :root {
+      --action: {{.AccentColor}};
+      --action-secondary: #f3dd77;
+      --action-secondary-strong: #ffe995;
+      --action-secondary-glow: rgba(243, 221, 119, 0.26);
+    }
+  </style>
 </head>
 <body>
   <main class="shell">
