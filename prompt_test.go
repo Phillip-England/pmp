@@ -498,7 +498,7 @@ func TestLoadProjectInstructionsUsesBuiltInDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadProjectInstructions returned error: %v", err)
 	}
-	if !strings.Contains(body, "Required Response Note") || !strings.Contains(body, ".pmp/responses/") {
+	if !strings.Contains(body, "Required History Note") || !strings.Contains(body, ".pmp/history/") {
 		t.Fatalf("unexpected instructions body %q", body)
 	}
 }
@@ -531,7 +531,7 @@ func TestLoadProjectInstructionsUsesLegacyProjectFile(t *testing.T) {
 	}
 }
 
-func TestRunInitCreatesResponsesDirectory(t *testing.T) {
+func TestRunInitCreatesHistoryDirectory(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd returned error: %v", err)
@@ -547,8 +547,8 @@ func TestRunInitCreatesResponsesDirectory(t *testing.T) {
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tempDir, projectDirName, responsesDirName)); err != nil {
-		t.Fatalf("expected responses directory, got %v", err)
+	if _, err := os.Stat(filepath.Join(tempDir, projectDirName, historyDirName)); err != nil {
+		t.Fatalf("expected history directory, got %v", err)
 	}
 }
 
@@ -1159,7 +1159,7 @@ func TestServeCompileIncludesBuiltInInstructionsByDefault(t *testing.T) {
 	if !strings.Contains(payload["compiled"], "<!-- INSTRUCTIONS SECTION -->") || !strings.Contains(payload["compiled"], "<!-- PROMPTS SECTION -->") {
 		t.Fatalf("expected compile sections, got %q", payload["compiled"])
 	}
-	if !strings.Contains(payload["compiled"], "Required Response Note") {
+	if !strings.Contains(payload["compiled"], "Required History Note") {
 		t.Fatalf("expected instructions prefix, got %q", payload["compiled"])
 	}
 }
@@ -1225,7 +1225,7 @@ func TestLoadResponsesReadsResponseNotes(t *testing.T) {
 	if err := runInit(); err != nil {
 		t.Fatalf("runInit returned error: %v", err)
 	}
-	responseDir := filepath.Join(tempDir, projectDirName, responsesDirName)
+	responseDir := filepath.Join(tempDir, projectDirName, historyDirName)
 	response := Prompt{
 		Title:     "Model Response",
 		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
@@ -1262,7 +1262,7 @@ func TestRunRemoveResponseDeletesByIndex(t *testing.T) {
 		t.Fatalf("runInit returned error: %v", err)
 	}
 
-	responseDir := filepath.Join(projectRoot, projectDirName, responsesDirName)
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
 	response := Prompt{
 		Title:     "Model Response",
 		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
@@ -1299,7 +1299,7 @@ func TestServeDeleteResponseRemovesResponse(t *testing.T) {
 		t.Fatalf("runInit returned error: %v", err)
 	}
 
-	responseDir := filepath.Join(projectRoot, projectDirName, responsesDirName)
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
 	first := Prompt{Title: "Older", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Older\n\nA\n"}
 	second := Prompt{Title: "Newer", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# Newer\n\nB\n"}
 	if err := os.WriteFile(filepath.Join(responseDir, "20260508T120000Z-older.md"), []byte(formatPromptFile(first)), 0o644); err != nil {
@@ -1310,14 +1310,14 @@ func TestServeDeleteResponseRemovesResponse(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/responses/delete", strings.NewReader("delete_response=1"))
+	req := httptest.NewRequest("POST", "/history/delete", strings.NewReader("delete_response=1"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	serveDeleteResponse(rec, req)
 
 	if rec.Code != 303 {
 		t.Fatalf("expected redirect status, got %d", rec.Code)
 	}
-	if location := rec.Header().Get("Location"); location != "/responses" {
+	if location := rec.Header().Get("Location"); location != "/history" {
 		t.Fatalf("unexpected redirect location %q", location)
 	}
 	responses, err := loadResponses()
@@ -1326,6 +1326,53 @@ func TestServeDeleteResponseRemovesResponse(t *testing.T) {
 	}
 	if len(responses) != 1 || responses[0].Title != "Older" {
 		t.Fatalf("unexpected responses %#v", responses)
+	}
+}
+
+func TestServeDeleteResponseRemovesMultipleResponses(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
+	responses := []Prompt{
+		{Title: "Older", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Older\n\nA\n"},
+		{Title: "Middle", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# Middle\n\nB\n"},
+		{Title: "Newer", Timestamp: time.Date(2026, 5, 8, 12, 2, 0, 0, time.UTC), Markdown: "# Newer\n\nC\n"},
+	}
+	for _, response := range responses {
+		if err := os.WriteFile(filepath.Join(responseDir, response.Timestamp.Format("20060102T150405Z")+"-"+slugify(response.Title)+".md"), []byte(formatPromptFile(response)), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/history/delete", strings.NewReader("delete_response=0&delete_response=2"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveDeleteResponse(rec, req)
+
+	if rec.Code != 303 {
+		t.Fatalf("expected redirect status, got %d", rec.Code)
+	}
+	remaining, err := loadResponses()
+	if err != nil {
+		t.Fatalf("loadResponses returned error: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Title != "Middle" {
+		t.Fatalf("unexpected remaining responses %#v", remaining)
 	}
 }
 
@@ -1347,7 +1394,7 @@ func TestServeResponsesUsesCardClickWithoutViewButton(t *testing.T) {
 		t.Fatalf("runInit returned error: %v", err)
 	}
 
-	responseDir := filepath.Join(projectRoot, projectDirName, responsesDirName)
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
 	response := Prompt{
 		Title:     "Model Response",
 		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
@@ -1358,18 +1405,381 @@ func TestServeResponsesUsesCardClickWithoutViewButton(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/responses", nil)
+	req := httptest.NewRequest("GET", "/history", nil)
 	serveResponses(rec, req)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, `onclick="openResponseModal('prompt-0')"`) {
-		t.Fatalf("expected card click handler in response page, got %q", body)
+		t.Fatalf("expected card click handler in history page, got %q", body)
 	}
 	if !strings.Contains(body, ".prompt-card.clickable-card:hover") || !strings.Contains(body, "cursor: pointer;") {
-		t.Fatalf("expected clickable hover styling in response page, got %q", body)
+		t.Fatalf("expected clickable hover styling in history page, got %q", body)
 	}
 	if strings.Contains(body, ">View<") {
-		t.Fatalf("did not expect view button in response page, got %q", body)
+		t.Fatalf("did not expect view button in history page, got %q", body)
+	}
+}
+
+func TestServeResponsesShowsUnreadStateAndNavBadge(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
+	first := Prompt{Title: "First", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# First\n\nA\n"}
+	second := Prompt{Title: "Second", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# Second\n\nB\n"}
+	firstPath := filepath.Join(responseDir, "20260508T120000Z-first.md")
+	secondPath := filepath.Join(responseDir, "20260508T120100Z-second.md")
+	if err := os.WriteFile(firstPath, []byte(formatPromptFile(first)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if err := os.WriteFile(secondPath, []byte(formatPromptFile(second)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if err := saveResponseReadState(map[string]bool{firstPath: true}); err != nil {
+		t.Fatalf("saveResponseReadState returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/history", nil)
+	serveResponses(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="prompt-card response-card clickable-card unread"`) {
+		t.Fatalf("expected unread response card styling, got %q", body)
+	}
+	if !strings.Contains(body, `History<span class="nav-badge">1</span>`) {
+		t.Fatalf("expected unread nav badge, got %q", body)
+	}
+}
+
+func TestServeOpenResponseMarksResponseRead(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	targetPath := filepath.Join(projectRoot, projectDirName, historyDirName, "20260508T120500Z-model-response.md")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/history/open", strings.NewReader(url.Values{
+		"path": {targetPath},
+	}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveOpenResponse(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected ok status, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	state, err := loadResponseReadState()
+	if err != nil {
+		t.Fatalf("loadResponseReadState returned error: %v", err)
+	}
+	if !state[targetPath] {
+		t.Fatalf("expected response to be marked read, got %#v", state)
+	}
+}
+
+func TestServeMarkAllResponsesReadMarksEveryResponseRead(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
+	firstPath := filepath.Join(responseDir, "20260508T120000Z-first.md")
+	secondPath := filepath.Join(responseDir, "20260508T120100Z-second.md")
+	first := Prompt{Title: "First", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# First\n\nA\n"}
+	second := Prompt{Title: "Second", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# Second\n\nB\n"}
+	if err := os.WriteFile(firstPath, []byte(formatPromptFile(first)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	if err := os.WriteFile(secondPath, []byte(formatPromptFile(second)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/history/read-all", nil)
+	serveMarkAllResponsesRead(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected ok status, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	state, err := loadResponseReadState()
+	if err != nil {
+		t.Fatalf("loadResponseReadState returned error: %v", err)
+	}
+	if !state[firstPath] || !state[secondPath] {
+		t.Fatalf("expected both responses marked read, got %#v", state)
+	}
+}
+
+func TestServeNewPromptShowsRecentPromptsAndQuickCompile(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	promptsDir := filepath.Join(projectRoot, projectDirName, promptsDirName)
+	prompts := []Prompt{
+		{Title: "Marked", Timestamp: time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC), Markdown: "# Marked\n\nA\n"},
+		{Title: "Recent One", Timestamp: time.Date(2026, 5, 8, 12, 1, 0, 0, time.UTC), Markdown: "# Recent One\n\nB\n"},
+		{Title: "Recent Two", Timestamp: time.Date(2026, 5, 8, 12, 2, 0, 0, time.UTC), Markdown: "# Recent Two\n\nC\n"},
+	}
+	for _, prompt := range prompts {
+		if err := os.WriteFile(filepath.Join(promptsDir, prompt.Timestamp.Format("20060102T150405Z")+"-"+slugify(prompt.Title)+".md"), []byte(formatPromptFile(prompt)), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+	}
+	if err := saveMarks(map[int]bool{0: true}); err != nil {
+		t.Fatalf("saveMarks returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/new", nil)
+	serveNewPrompt(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Recent Since Mark") || !strings.Contains(body, "Recent One") || !strings.Contains(body, "Recent Two") {
+		t.Fatalf("expected recent prompt titles on new page, got %q", body)
+	}
+	if !strings.Contains(body, "Quick compile") || !strings.Contains(body, "quickCompileFromMark()") {
+		t.Fatalf("expected quick compile action on new page, got %q", body)
+	}
+	if !strings.Contains(body, `class="secondary"`) {
+		t.Fatalf("expected colored quick compile button, got %q", body)
+	}
+}
+
+func TestServeSkillsUsesCardClickWithoutViewSkillButton(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/skills", nil)
+	serveSkills(rec, req)
+
+	body := rec.Body.String()
+	if strings.Contains(body, ">View skill<") {
+		t.Fatalf("did not expect view skill button, got %q", body)
+	}
+	if !strings.Contains(body, `class="skill-card clickable-card"`) || !strings.Contains(body, `onclick="openSkillModal(this)"`) {
+		t.Fatalf("expected clickable skill card, got %q", body)
+	}
+	if !strings.Contains(body, ".skill-card.clickable-card:hover") || !strings.Contains(body, "border-color: var(--action);") {
+		t.Fatalf("expected stronger skill hover styling, got %q", body)
+	}
+}
+
+func TestServeResponsesIncludesImmediateReadUIAndMarkAllAction(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	responseDir := filepath.Join(projectRoot, projectDirName, historyDirName)
+	response := Prompt{
+		Title:     "Unread Response",
+		Timestamp: time.Date(2026, 5, 8, 12, 5, 0, 0, time.UTC),
+		Markdown:  "# Unread Response\n\nImportant result.\n",
+	}
+	if err := os.WriteFile(filepath.Join(responseDir, "20260508T120500Z-unread-response.md"), []byte(formatPromptFile(response)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/history", nil)
+	serveResponses(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "markResponseCardRead(card)") || !strings.Contains(body, "setUnreadSummaryCount(unreadCards)") {
+		t.Fatalf("expected immediate unread UI update logic, got %q", body)
+	}
+	if !strings.Contains(body, "Mark all as read") || !strings.Contains(body, "markAllResponsesRead()") {
+		t.Fatalf("expected mark all as read action, got %q", body)
+	}
+}
+
+func TestServeSettingsUsesCompactColorInputs(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/settings", nil)
+	serveSettings(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "color-swatch-row") || !strings.Contains(body, "width: 3rem;") {
+		t.Fatalf("expected compact color input layout, got %q", body)
+	}
+}
+
+func TestServeCompileHistoryProducesHistorySection(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	projectRoot := t.TempDir()
+	if err := setProjectRootOverride(projectRoot); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	historyDir := filepath.Join(projectRoot, projectDirName, historyDirName)
+	entry := Prompt{
+		Title:     "Implemented Search",
+		Timestamp: time.Date(2026, 5, 10, 23, 0, 0, 0, time.UTC),
+		Markdown:  "# Implemented Search\n\nAdded the new search flow.\n",
+	}
+	if err := os.WriteFile(filepath.Join(historyDir, "20260510T230000Z-implemented-search.md"), []byte(formatPromptFile(entry)), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/history/compile", strings.NewReader("mode=all"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	serveCompileHistory(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if !strings.Contains(payload["compiled"], "<!-- HISTORY SECTION -->") || !strings.Contains(payload["compiled"], "assistant who previously made changes") {
+		t.Fatalf("expected history compile document, got %q", payload["compiled"])
+	}
+}
+
+func TestServeProjectsUsesClickableCardsWithoutSwitchButtons(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.Setenv("PMP_CONFIG_HOME", configDir); err != nil {
+		t.Fatalf("Setenv returned error: %v", err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PMP_CONFIG_HOME")
+	}()
+	defer clearProjectRootOverride()
+
+	currentProject := t.TempDir()
+	if err := setProjectRootOverride(currentProject); err != nil {
+		t.Fatalf("setProjectRootOverride returned error: %v", err)
+	}
+	if err := runInit(); err != nil {
+		t.Fatalf("runInit returned error: %v", err)
+	}
+
+	otherProject := filepath.Join(t.TempDir(), "other")
+	if err := initProjectAtRoot(otherProject); err != nil {
+		t.Fatalf("initProjectAtRoot returned error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/projects", nil)
+	serveProjects(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="panel project-card clickable-card`) || !strings.Contains(body, `onclick="window.location.href='`) {
+		t.Fatalf("expected clickable project cards, got %q", body)
+	}
+	if strings.Contains(body, `>Switch to project<`) || strings.Contains(body, `>Open current project<`) {
+		t.Fatalf("did not expect project action button text, got %q", body)
 	}
 }
 

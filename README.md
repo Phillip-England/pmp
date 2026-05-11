@@ -9,7 +9,7 @@ It stores prompts as markdown files, keeps lightweight project memory alongside 
 - Tracks prompts in `.pmp/prompts/` as timestamped markdown files with YAML frontmatter
 - Uses built-in compile instructions by default
 - Stores reusable project memory in `.pmp/memory/`
-- Stores response notes in `.pmp/responses/`
+- Stores assistant history notes in `.pmp/history/`
 - Lets you mark a prompt and compile from that mark forward
 - Supports a focused CLI for fast operations
 - Provides a local web UI for browsing project context and compiling history
@@ -88,14 +88,14 @@ your-project/
 │   ├── marks.txt
 │   ├── memory/
 │   ├── prompts/
-│   └── responses/
+│   └── history/
 ```
 
 What each part is for:
 
 - `.pmp/prompts/`: chronological prompt history
 - `.pmp/memory/`: durable project context that should apply across prompts
-- `.pmp/responses/`: response notes written after important work completes
+- `.pmp/history/`: assistant history notes written after important work completes
 - `.pmp/marks.txt`: the current marked prompt index
 - `.pmp/draft.md`: draft buffer for editor-based prompt entry
 
@@ -246,11 +246,11 @@ Skills are opt-in during compilation. PMP also seeds a few built-in defaults. Th
 - review heuristics
 - writing styles
 
-### Responses
+### History
 
-Shows response notes stored in `.pmp/responses/`.
+Shows assistant history notes stored in `.pmp/history/`.
 
-These are important because compiled instructions explicitly require the receiving model to write at least one response note after important work completes.
+These are important because compiled instructions explicitly require the receiving model to write at least one history note after important work completes.
 
 ### Projects
 
@@ -302,12 +302,12 @@ We need to compile a specific inclusive range from the CLI.
 
 Titles are required, and prompt bodies cannot be empty.
 
-## Response Notes
+## History Notes
 
-Compiled output instructs downstream agents to write response notes back into the project. Those notes should:
+Compiled output instructs downstream agents to write history notes back into the project. Those notes should:
 
 - be new timestamped markdown files
-- live in `.pmp/responses/`
+- live in `.pmp/history/`
 - use YAML frontmatter with `title` and `timestamp`
 - include a matching top-level heading
 - stay short when possible
@@ -322,7 +322,7 @@ Not every action belongs in the terminal.
 The current split is deliberate:
 
 - CLI: quick prompt capture, listing, marking, deleting, compiling
-- Web UI: browsing, filtering, memory management, skill selection, responses, settings, multi-project navigation
+- Web UI: browsing, filtering, memory management, skill selection, history, settings, multi-project navigation
 
 That keeps the command surface practical while preserving a better interface for context-heavy tasks.
 

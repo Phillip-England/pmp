@@ -31,6 +31,7 @@ type navItem struct {
 	Label   string
 	Href    string
 	Current bool
+	Badge   int
 }
 
 type currentProjectData struct {
@@ -56,6 +57,9 @@ type newPromptPageData struct {
 	Title                string
 	Body                 string
 	Saved                bool
+	Compiled             bool
+	RecentPrompts        []PromptView
+	RecentPromptCount    int
 	AccentColor          string
 	SecondaryAccentColor string
 }
@@ -129,8 +133,10 @@ type promptListPage struct {
 type responseListPage struct {
 	Nav                  []navItem
 	CurrentProject       currentProjectData
-	Responses            []PromptView
-	TotalResponses       int
+	History              []PromptView
+	TotalHistory         int
+	UnreadHistory        int
+	Compiled             bool
 	AccentColor          string
 	SecondaryAccentColor string
 }
@@ -145,6 +151,7 @@ type PromptView struct {
 	ElementID  string
 	Marked     bool
 	Checked    bool
+	Unread     bool
 	Path       string
 }
 
@@ -242,8 +249,15 @@ func runServe() error {
 	mux.HandleFunc("/skills", serveSkills)
 	mux.HandleFunc("/settings", serveSettings)
 	mux.HandleFunc("/prompts", servePrompts)
+	mux.HandleFunc("/history", serveResponses)
+	mux.HandleFunc("/history/delete", serveDeleteResponse)
+	mux.HandleFunc("/history/open", serveOpenResponse)
+	mux.HandleFunc("/history/read-all", serveMarkAllResponsesRead)
+	mux.HandleFunc("/history/compile", serveCompileHistory)
 	mux.HandleFunc("/responses", serveResponses)
 	mux.HandleFunc("/responses/delete", serveDeleteResponse)
+	mux.HandleFunc("/responses/open", serveOpenResponse)
+	mux.HandleFunc("/responses/read-all", serveMarkAllResponsesRead)
 	mux.HandleFunc("/prompts/delete", serveDeletePrompt)
 	mux.HandleFunc("/projects", serveProjects)
 	mux.HandleFunc("/projects/switch", serveProjectSwitch)
@@ -430,7 +444,7 @@ func servePrompts(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveResponses(w http.ResponseWriter, r *http.Request) {
-	responses, err := loadResponses()
+	history, err := loadHistory()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -440,11 +454,19 @@ func serveResponses(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	views := buildPromptViews(responses, nil)
+	readState, err := loadResponseReadState()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	views := buildPromptViews(history, nil)
+	unreadCount := applyUnreadResponseState(views, readState)
 	data := responseListPage{
-		Nav:                  buildNav("/responses"),
-		Responses:            views,
-		TotalResponses:       len(responses),
+		Nav:                  buildNav("/history"),
+		History:              views,
+		TotalHistory:         len(history),
+		UnreadHistory:        unreadCount,
+		Compiled:             r.URL.Query().Get("compiled") == "1",
 		AccentColor:          themeSettings.AccentColor,
 		SecondaryAccentColor: themeSettings.SecondaryAccentColor,
 	}
@@ -465,21 +487,123 @@ func serveDeleteResponse(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	indexValue := strings.TrimSpace(r.Form.Get("delete_response"))
-	if indexValue == "" {
+	indexValues := r.Form["delete_response"]
+	if len(indexValues) == 0 {
 		http.Error(w, "missing response index", http.StatusBadRequest)
 		return
 	}
-	response, _, err := responseByIndexArg(indexValue)
+	history, err := loadHistory()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	paths, err := resolveResponseDeletePaths(indexValues, history)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := os.Remove(response.Path); err != nil {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := removeResponseReadStatePaths(paths); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/responses", http.StatusSeeOther)
+	redirectPath := "/history"
+	if strings.HasPrefix(r.URL.Path, "/responses") {
+		redirectPath = "/responses"
+	}
+	http.Redirect(w, r, redirectPath, http.StatusSeeOther)
+}
+
+func serveOpenResponse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := parseRequestForm(r); err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()}, http.StatusBadRequest)
+		return
+	}
+	path := strings.TrimSpace(r.Form.Get("path"))
+	if path == "" {
+		writeJSON(w, map[string]string{"error": "missing response path"}, http.StatusBadRequest)
+		return
+	}
+	if err := markResponseOpened(path); err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"opened": path}, http.StatusOK)
+}
+
+func serveMarkAllResponsesRead(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	history, err := loadHistory()
+	if err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+		return
+	}
+	if err := markAllResponsesOpened(history); err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()}, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"marked": "all"}, http.StatusOK)
+}
+
+func serveCompileHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		http.Redirect(w, r, "/history", http.StatusSeeOther)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	history, err := loadHistory()
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	projectInstructions, err := loadProjectInstructions()
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	memories, err := loadMemories()
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	selected, err := resolveHistoryCompileIndexes(r.Form, len(history))
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	compiled, err := compileHistoryIndexes(history, selected)
+	if err != nil {
+		writeCompileJSON(w, "", err)
+		return
+	}
+	includeInstructions := true
+	if raw := strings.TrimSpace(r.Form.Get("include_instructions")); raw != "" {
+		includeInstructions, err = parseBoolFlag(raw)
+		if err != nil {
+			writeCompileJSON(w, "", fmt.Errorf("invalid include_instructions value %q", raw))
+			return
+		}
+	}
+	writeCompileJSON(w, assembleHistoryCompiledDocument(projectInstructions, memories, compiled, includeInstructions), nil)
 }
 
 func serveCompile(w http.ResponseWriter, r *http.Request) {
@@ -563,6 +687,10 @@ func serveNewPrompt(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("saved") == "1" {
 		data.Saved = true
 	}
+	if r.URL.Query().Get("compiled") == "1" {
+		data.Compiled = true
+	}
+	populateNewPromptPageData(&data)
 
 	switch r.Method {
 	case http.MethodGet:
@@ -1009,15 +1137,24 @@ func ensureInitialPromptMark() error {
 }
 
 func buildNav(current string) []navItem {
-	return []navItem{
+	items := []navItem{
 		{Label: "New", Href: "/new", Current: current == "/new"},
 		{Label: "Projects", Href: "/projects", Current: current == "/projects"},
 		{Label: "Memory", Href: "/memory", Current: current == "/memory"},
 		{Label: "Settings", Href: "/settings", Current: current == "/settings"},
 		{Label: "Skills", Href: "/skills", Current: current == "/skills"},
 		{Label: "Prompts", Href: "/prompts", Current: current == "/prompts"},
-		{Label: "Responses", Href: "/responses", Current: current == "/responses"},
+		{Label: "History", Href: "/history", Current: current == "/history"},
 	}
+	if unread, err := countUnreadResponses(); err == nil && unread > 0 {
+		for i := range items {
+			if items[i].Label == "History" {
+				items[i].Badge = unread
+				break
+			}
+		}
+	}
+	return items
 }
 
 func loadCurrentProjectData() (currentProjectData, error) {
@@ -1118,6 +1255,79 @@ func buildPromptViews(prompts []Prompt, marks map[int]bool) []PromptView {
 	return views
 }
 
+func buildPromptViewsForIndexes(prompts []Prompt, indexes []int, marks map[int]bool) []PromptView {
+	views := make([]PromptView, 0, len(indexes))
+	for i := len(indexes) - 1; i >= 0; i-- {
+		index := indexes[i]
+		if index < 0 || index >= len(prompts) {
+			continue
+		}
+		prompt := prompts[index]
+		marked := false
+		if marks != nil {
+			marked = marks[index]
+		}
+		views = append(views, PromptView{
+			Index:      index,
+			Title:      prompt.Title,
+			Timestamp:  prompt.Timestamp.Local().Format("2006-01-02 15:04:05 MST"),
+			DateValue:  prompt.Timestamp.Local().Format("2006-01-02"),
+			SearchText: strings.ToLower(prompt.Title + "\n" + prompt.Markdown),
+			HTMLBody:   template.HTML(renderMarkdown(prompt.Markdown)),
+			ElementID:  fmt.Sprintf("prompt-%d", index),
+			Marked:     marked,
+			Path:       prompt.Path,
+		})
+	}
+	return views
+}
+
+func populateNewPromptPageData(data *newPromptPageData) {
+	prompts, marks, err := loadPromptState()
+	if err != nil {
+		return
+	}
+	indexes, err := indexesFromMarkExclusive(len(prompts), marks)
+	if err != nil {
+		return
+	}
+	data.RecentPrompts = buildPromptViewsForIndexes(prompts, indexes, marks)
+	data.RecentPromptCount = len(data.RecentPrompts)
+}
+
+func applyUnreadResponseState(views []PromptView, readState map[string]bool) int {
+	unread := 0
+	for i := range views {
+		if readState[views[i].Path] {
+			continue
+		}
+		views[i].Unread = true
+		unread++
+	}
+	return unread
+}
+
+func resolveResponseDeletePaths(values []string, entries []Prompt) ([]string, error) {
+	seen := map[string]bool{}
+	paths := make([]string, 0, len(values))
+	for _, raw := range values {
+		index, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("invalid history index %q", raw)
+		}
+		if index < 0 || index >= len(entries) {
+			return nil, fmt.Errorf("history index %d is out of bounds; highest history index is %d", index, len(entries)-1)
+		}
+		path := entries[index].Path
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
 func buildSkillToggles(skills []Skill, included []string) []SkillToggle {
 	includedSet := skillNamesSet(included)
 	toggles := make([]SkillToggle, 0, len(skills))
@@ -1207,6 +1417,30 @@ func resolveCompileIndexes(values url.Values, promptCount int) ([]int, error) {
 	}
 }
 
+func resolveHistoryCompileIndexes(values url.Values, historyCount int) ([]int, error) {
+	mode := strings.TrimSpace(values.Get("mode"))
+	switch mode {
+	case "", "all":
+		indexes := make([]int, 0, historyCount)
+		for i := 0; i < historyCount; i++ {
+			indexes = append(indexes, i)
+		}
+		return indexes, nil
+	case "range":
+		start, err := strconv.Atoi(strings.TrimSpace(values.Get("range_start")))
+		if err != nil {
+			return nil, errors.New("range start must be a valid history index")
+		}
+		end, err := strconv.Atoi(strings.TrimSpace(values.Get("range_end")))
+		if err != nil {
+			return nil, errors.New("range end must be a valid history index")
+		}
+		return compileIndexesForRange(historyCount, compileRange{Start: start, End: end})
+	default:
+		return nil, errors.New("invalid history compile mode")
+	}
+}
+
 func compileIndexesForRange(promptCount int, rng compileRange) ([]int, error) {
 	if rng.Start < 0 || rng.End < 0 {
 		return nil, errors.New("compile range indexes must be non-negative")
@@ -1230,6 +1464,100 @@ func compileIndexesForRange(promptCount int, rng compileRange) ([]int, error) {
 func shouldUpdateMark(values url.Values) bool {
 	raw := strings.TrimSpace(strings.ToLower(values.Get("update_mark")))
 	return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+}
+
+func loadResponseReadState() (map[string]bool, error) {
+	path, err := historyReadsPath()
+	if err != nil {
+		return nil, err
+	}
+	payload, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return map[string]bool{}, nil
+	}
+	state := map[string]bool{}
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func saveResponseReadState(state map[string]bool) error {
+	path, err := historyReadsPath()
+	if err != nil {
+		return err
+	}
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, payload, 0o644)
+}
+
+func markResponseOpened(path string) error {
+	state, err := loadResponseReadState()
+	if err != nil {
+		return err
+	}
+	state[path] = true
+	return saveResponseReadState(state)
+}
+
+func markAllResponsesOpened(entries []Prompt) error {
+	state, err := loadResponseReadState()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		state[entry.Path] = true
+	}
+	return saveResponseReadState(state)
+}
+
+func removeResponseReadStatePaths(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	state, err := loadResponseReadState()
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, path := range paths {
+		if !state[path] {
+			continue
+		}
+		delete(state, path)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return saveResponseReadState(state)
+}
+
+func countUnreadResponses() (int, error) {
+	history, err := loadHistory()
+	if err != nil {
+		return 0, err
+	}
+	state, err := loadResponseReadState()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range history {
+		if !state[entry.Path] {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func renderMarkdown(markdown string) string {
@@ -1506,6 +1834,24 @@ const baseStyles = `
     flex-wrap: wrap;
     margin-left: auto;
   }
+  .nav-link-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .nav-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.2rem;
+    height: 1.2rem;
+    padding: 0 0.3rem;
+    border-radius: 999px;
+    background: var(--action-secondary);
+    color: #000000;
+    font-size: 0.68rem;
+    line-height: 1;
+  }
   .nav-brand {
     margin-right: 0.35rem;
     padding: 0.1rem 0.15rem;
@@ -1538,9 +1884,18 @@ const baseStyles = `
     color: #000000;
     border-color: var(--action);
   }
+  .button.secondary, button.secondary {
+    background: var(--action-secondary);
+    color: #000000;
+    border-color: var(--action-secondary);
+  }
   .nav a.current:hover, .button.primary:hover, button.primary:hover {
     background: color-mix(in srgb, var(--action) 88%, white);
     border-color: color-mix(in srgb, var(--action) 88%, white);
+  }
+  .button.secondary:hover, button.secondary:hover {
+    background: color-mix(in srgb, var(--action-secondary) 86%, white);
+    border-color: color-mix(in srgb, var(--action-secondary) 86%, white);
   }
   .panel, details {
     border: 1px solid var(--border);
@@ -1770,8 +2125,12 @@ const baseStyles = `
     resize: vertical;
   }
   input[type="color"] {
+    width: 3rem;
+    min-width: 3rem;
+    height: 3rem;
     min-height: 3rem;
-    padding: 0.3rem;
+    padding: 0.15rem;
+    border-radius: 0.8rem;
   }
   .form-grid {
     display: grid;
@@ -1864,9 +2223,44 @@ const baseStyles = `
     padding: 0.8rem;
     align-content: space-between;
   }
+  .project-card.clickable-card {
+    cursor: pointer;
+    transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+  }
+  .project-card.clickable-card:hover,
+  .project-card.clickable-card:focus-visible,
+  .project-card.clickable-card:focus-within {
+    transform: translateY(-2px);
+    border-color: var(--action-secondary);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--action-secondary) 42%, transparent),
+      0 0.8rem 1.8rem rgba(0, 0, 0, 0.24);
+    background: color-mix(in srgb, var(--action-secondary) 6%, var(--panel));
+  }
   .project-meta {
     display: grid;
     gap: 0.2rem;
+  }
+  .response-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.7rem;
+  }
+  .response-select {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+  .color-swatch-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.9rem;
+    align-items: end;
+  }
+  .color-swatch-row .label {
+    width: auto;
   }
   .skill-grid {
     display: flex;
@@ -1882,6 +2276,20 @@ const baseStyles = `
     background: var(--panel);
     flex: 0 1 16rem;
     min-width: 13rem;
+  }
+  .skill-card.clickable-card {
+    cursor: pointer;
+    transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+  }
+  .skill-card.clickable-card:hover,
+  .skill-card.clickable-card:focus-visible,
+  .skill-card.clickable-card:focus-within {
+    transform: translateY(-2px);
+    border-color: var(--action);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--action) 42%, transparent),
+      0 0.8rem 1.8rem rgba(0, 0, 0, 0.24);
+    background: color-mix(in srgb, var(--action) 6%, var(--panel));
   }
   .skill-card-title {
     font-weight: 600;
@@ -1919,6 +2327,15 @@ const baseStyles = `
     border-color: var(--mark-border);
     background: var(--mark-bg);
   }
+  .response-card.unread {
+    border-color: var(--action-secondary);
+    background:
+      linear-gradient(135deg, color-mix(in srgb, var(--action-secondary) 10%, transparent), transparent 60%),
+      var(--panel);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--action-secondary) 18%, transparent),
+      0 1rem 2.5rem rgba(0, 0, 0, 0.22);
+  }
   .prompt-card.clickable-card.marked:hover,
   .prompt-card.clickable-card.marked:focus-visible,
   .prompt-card.clickable-card.marked:focus-within {
@@ -1941,6 +2358,20 @@ const baseStyles = `
     display: flex;
     flex-wrap: wrap;
     gap: 0.55rem;
+  }
+  .recent-prompts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem;
+  }
+  .recent-prompt-chip {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.3rem;
+    padding: 0.45rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 0.7rem;
+    background: #050505;
   }
   .skill-toggle {
     display: inline-flex;
@@ -2070,7 +2501,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!doctype html>
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     <section class="panel compact">
       <div>{{.TotalPrompts}} prompts{{if .HasMark}} <span class="muted">marked: {{.MarkedIndex}}</span>{{end}}</div>
@@ -2105,11 +2536,12 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
-  ` + currentProjectBanner + `
+    ` + currentProjectBanner + `
     {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
     {{if .Saved}}<section class="panel success">saved</section>{{end}}
+    {{if .Compiled}}<section class="panel success">compiled to clipboard</section>{{end}}
     <section class="panel">
       <form method="post" class="form-grid">
         <label class="label">
@@ -2122,10 +2554,67 @@ var newPromptTemplate = template.Must(template.New("new-prompt").Parse(`<!doctyp
         </label>
         <div class="actions spaced">
           <button type="submit" class="primary">Save prompt</button>
+          <button type="button" class="secondary" onclick="quickCompileFromMark()">Quick compile</button>
         </div>
       </form>
     </section>
+    {{if .RecentPrompts}}
+    <section class="panel stack">
+      <div>
+        <h2 class="section-title">Recent Since Mark</h2>
+        <div class="instructions">{{.RecentPromptCount}} prompt{{if ne .RecentPromptCount 1}}s{{end}} newer than the current mark.</div>
+      </div>
+      <div class="recent-prompts">
+        {{range .RecentPrompts}}
+        <div class="recent-prompt-chip">{{.Title}}</div>
+        {{end}}
+      </div>
+    </section>
+    {{end}}
   </main>
+  <script>
+    function quickCompileFromMark() {
+      var params = new URLSearchParams();
+      params.set('mode', 'from_mark');
+      params.set('update_mark', '1');
+      params.set('include_instructions', 'true');
+      fetch('/compile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+        },
+        body: params.toString()
+      }).then(function(response) {
+        return response.json();
+      }).then(function(payload) {
+        if (payload.error) {
+          alert(payload.error);
+          return;
+        }
+        var text = payload.compiled || '';
+        function fallbackCopy() {
+          var area = document.createElement('textarea');
+          area.value = text;
+          document.body.appendChild(area);
+          area.focus();
+          area.select();
+          try {
+            document.execCommand('copy');
+          } catch (err) {
+          }
+          document.body.removeChild(area);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).catch(fallbackCopy).finally(function() {
+            window.location.href = '/new?compiled=1';
+          });
+        } else {
+          fallbackCopy();
+          window.location.href = '/new?compiled=1';
+        }
+      });
+    }
+  </script>
   ` + liveReloadScript + `
 </body>
 </html>`))
@@ -2150,7 +2639,7 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     ` + currentProjectBanner + `
     {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
@@ -2173,13 +2662,10 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
       {{if .Skills}}
       <div class="skill-grid">
         {{range .Skills}}
-        <section class="skill-card">
+        <section class="skill-card clickable-card" tabindex="0" role="button" aria-label="Open skill {{.Name}}" onclick="openSkillModal(this)" onkeydown="activateCardModal(event, this)">
           <div class="skill-card-title">{{.Name}}</div>
           <textarea class="clipboard-source" readonly>{{.Body}}</textarea>
-          <div class="actions">
-            <button type="button" onclick="openSkillModal(this)">View skill</button>
-          </div>
-          <dialog class="prompt-modal">
+          <dialog class="prompt-modal" onclick="event.stopPropagation()">
             <div class="modal-shell">
               <div class="modal-header">
                 <div>
@@ -2218,6 +2704,15 @@ var skillsTemplate = template.Must(template.New("skills").Parse(`<!doctype html>
     </section>
   </main>
   <script>
+    function activateCardModal(event, node) {
+      if (!event || !node) {
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openSkillModal(node);
+      }
+    }
     function closestSkillDialog(node) {
       var card = node ? node.closest('.skill-card') : null;
       return card ? card.querySelector('dialog') : null;
@@ -2290,7 +2785,7 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     ` + currentProjectBanner + `
     {{if .Error}}<section class="panel error">{{.Error}}</section>{{end}}
@@ -2301,14 +2796,16 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
           <h2 class="section-title">Theme</h2>
           <div class="instructions">Accent colors are system-wide.</div>
         </div>
-        <label class="label">
-          <span>Accent color</span>
-          <input type="color" name="accent_color" value="{{.AccentColor}}">
-        </label>
-        <label class="label">
-          <span>Secondary accent color</span>
-          <input type="color" name="secondary_accent_color" value="{{.SecondaryAccentColor}}">
-        </label>
+        <div class="color-swatch-row">
+          <label class="label">
+            <span>Accent color</span>
+            <input type="color" name="accent_color" value="{{.AccentColor}}">
+          </label>
+          <label class="label">
+            <span>Secondary accent color</span>
+            <input type="color" name="secondary_accent_color" value="{{.SecondaryAccentColor}}">
+          </label>
+        </div>
         <div class="stack">
           <h2 class="section-title">Preset Themes</h2>
           <div class="instructions">Apply one of the built-in color pairs, then save if you want to keep it.</div>
@@ -2439,7 +2936,7 @@ var memoryTemplate = template.Must(template.New("memory").Parse(`<!doctype html>
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     ` + currentProjectBanner + `
     <section class="panel">
@@ -2482,7 +2979,7 @@ var memoryTemplate = template.Must(template.New("memory").Parse(`<!doctype html>
           <div id="{{.ElementID}}-title" hidden>{{.Title}}</div>
           <div id="{{.ElementID}}-body" hidden>{{.Body}}</div>
           <div id="{{.ElementID}}-path" hidden>{{.Path}}</div>
-          <dialog id="{{.ElementID}}" class="prompt-modal">
+          <dialog id="{{.ElementID}}" class="prompt-modal" onclick="event.stopPropagation()">
             <div class="modal-shell">
               <div class="modal-header">
                 <div>
@@ -2616,12 +3113,12 @@ var memoryTemplate = template.Must(template.New("memory").Parse(`<!doctype html>
 </body>
 </html>`))
 
-var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype html>
+var responsesTemplate = template.Must(template.New("history").Parse(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pmp responses</title>
+  <title>pmp history</title>
   <style>` + baseStyles + `</style>
   <style>
     :root {
@@ -2636,22 +3133,65 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     ` + currentProjectBanner + `
+    {{if .Compiled}}<section class="panel success">compiled to clipboard</section>{{end}}
     <section class="panel compact">
-      <div>{{.TotalResponses}} responses</div>
-      <div class="instructions">Response notes are markdown files read from <code>.pmp/responses/</code>.</div>
+      <div>{{.TotalHistory}} history notes<span id="history-unread-summary">{{if gt .UnreadHistory 0}} · {{.UnreadHistory}} unread{{end}}</span></div>
+      <div class="instructions">History notes are markdown files read from <code>.pmp/history/</code>.</div>
     </section>
     <section class="panel stack">
+      <div class="compile-controls">
+        <div>
+          <h2 class="section-title">Compile History</h2>
+          <div class="instructions">Compile all history or an inclusive range.</div>
+        </div>
+        <div class="compile-controls-row">
+          <label class="label compile-range-field">
+            <span>Range start</span>
+            <input id="history-range-start" type="number" min="0" placeholder="0">
+          </label>
+          <label class="label compile-range-field">
+            <span>Range end</span>
+            <input id="history-range-end" type="number" min="0" placeholder="0">
+          </label>
+          <label class="compile-toggle">
+            <input id="history-include-instructions" type="checkbox" checked>
+            <span>Include built-in instructions</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" class="secondary" onclick="compileAllHistory()">Compile all</button>
+          <button type="button" onclick="compileHistoryRange()">Compile range</button>
+        </div>
+      </div>
+      {{if .History}}
+      <div class="response-toolbar">
+        <label class="response-select">
+          <input id="select-all-history" type="checkbox" onchange="toggleAllResponses(this.checked)">
+          <span>Select all</span>
+        </label>
+        <div class="actions">
+          <button type="button" class="secondary" onclick="markAllResponsesRead()">Mark all as read</button>
+          <button type="button" class="danger" onclick="deleteSelectedHistory()">Delete selected</button>
+        </div>
+      </div>
+      {{end}}
       <div class="prompt-grid">
-        {{range .Responses}}
-        <section class="prompt-card response-card clickable-card" data-date="{{.DateValue}}" tabindex="0" role="button" aria-label="Open response {{.Title}}" onclick="openResponseModal('{{.ElementID}}')" onkeydown="activateCardModal(event, '{{.ElementID}}', openResponseModal)">
-          <div class="prompt-card-copy">
-            <strong>{{.Title}}</strong>
-            <span class="small">{{.Timestamp}}</span>
+        {{range .History}}
+        <section class="prompt-card response-card clickable-card {{if .Unread}}unread{{end}}" data-date="{{.DateValue}}" data-path="{{.Path}}" tabindex="0" role="button" aria-label="Open history note {{.Title}}" onclick="openResponseModal('{{.ElementID}}')" onkeydown="activateCardModal(event, '{{.ElementID}}', openResponseModal)">
+          <div class="prompt-card-header">
+            <label class="response-select" onclick="event.stopPropagation()">
+              <input type="checkbox" class="response-checkbox" value="{{.Index}}" onchange="syncResponseSelectionState()">
+            </label>
+            <div class="prompt-card-copy">
+              <strong>{{.Title}}{{if .Unread}} <span class="mark-badge">unread</span>{{end}}</strong>
+              <span class="small">{{.Timestamp}}</span>
+            </div>
           </div>
           <div id="{{.ElementID}}-content" hidden>{{.HTMLBody}}</div>
+          <div id="{{.ElementID}}-path" hidden>{{.Path}}</div>
           <dialog id="{{.ElementID}}" class="prompt-modal">
             <div class="modal-shell">
               <div class="modal-header">
@@ -2663,7 +3203,7 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
               </div>
               <div class="modal-body" id="{{.ElementID}}-body"></div>
               <div class="prompt-actions">
-                <form method="post" action="/responses/delete" onclick="event.stopPropagation()">
+                <form method="post" action="/history/delete" onclick="event.stopPropagation()">
                   <input type="hidden" name="delete_response" value="{{.Index}}">
                   <button type="submit" class="danger">Delete</button>
                 </form>
@@ -2673,7 +3213,7 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
         </section>
         {{else}}
         <section class="panel">
-          <div class="muted">No responses yet.</div>
+          <div class="muted">No history yet.</div>
         </section>
         {{end}}
       </div>
@@ -2689,14 +3229,46 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
         opener(id);
       }
     }
+    function setUnreadSummaryCount(count) {
+      var summary = document.getElementById('history-unread-summary');
+      if (!summary) {
+        return;
+      }
+      if (count > 0) {
+        summary.textContent = ' · ' + count + ' unread';
+      } else {
+        summary.textContent = '';
+      }
+    }
+    function markResponseCardRead(card) {
+      if (!card || !card.classList.contains('unread')) {
+        return false;
+      }
+      card.classList.remove('unread');
+      var unreadBadge = card.querySelector('.mark-badge');
+      if (unreadBadge) {
+        unreadBadge.remove();
+      }
+      return true;
+    }
     function openResponseModal(id) {
       var dialog = document.getElementById(id);
       var body = document.getElementById(id + '-body');
       var content = document.getElementById(id + '-content');
+      var path = document.getElementById(id + '-path');
+      var card = dialog ? dialog.closest('.response-card') : null;
       if (!dialog || !body || !content) {
         return;
       }
       body.innerHTML = content.innerHTML;
+      if (markResponseCardRead(card)) {
+        syncUnreadResponseBadge();
+      }
+      if (path && path.textContent) {
+        var form = new FormData();
+        form.append('path', path.textContent);
+        fetch('/history/open', { method: 'POST', body: form });
+      }
       if (typeof dialog.showModal === 'function') {
         dialog.showModal();
       } else {
@@ -2719,6 +3291,138 @@ var responsesTemplate = template.Must(template.New("responses").Parse(`<!doctype
         event.target.close();
       }
     });
+    function responseCheckboxes() {
+      return Array.from(document.querySelectorAll('.response-checkbox'));
+    }
+    function syncUnreadResponseBadge() {
+      var unreadCards = document.querySelectorAll('.response-card.unread').length;
+      setUnreadSummaryCount(unreadCards);
+      var navLink = document.querySelector('.nav a[href="/history"] .nav-link-label');
+      if (!navLink) {
+        return;
+      }
+      var badge = navLink.querySelector('.nav-badge');
+      if (unreadCards > 0) {
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'nav-badge';
+          navLink.appendChild(badge);
+        }
+        badge.textContent = String(unreadCards);
+      } else if (badge) {
+        badge.remove();
+      }
+    }
+    function markAllResponsesRead() {
+      fetch('/history/read-all', { method: 'POST' }).then(function(response) {
+        return response.json();
+      }).then(function(payload) {
+        if (payload && payload.error) {
+          alert(payload.error);
+          return;
+        }
+        document.querySelectorAll('.response-card.unread').forEach(function(card) {
+          markResponseCardRead(card);
+        });
+        syncUnreadResponseBadge();
+      });
+    }
+    function syncResponseSelectionState() {
+      var boxes = responseCheckboxes();
+      var checked = boxes.filter(function(box) { return box.checked; }).length;
+      var selectAll = document.getElementById('select-all-history');
+      if (selectAll) {
+        selectAll.checked = boxes.length > 0 && checked === boxes.length;
+        selectAll.indeterminate = checked > 0 && checked < boxes.length;
+      }
+    }
+    function toggleAllResponses(checked) {
+      responseCheckboxes().forEach(function(box) {
+        box.checked = checked;
+      });
+      syncResponseSelectionState();
+    }
+    function deleteSelectedHistory() {
+      var selected = responseCheckboxes().filter(function(box) { return box.checked; });
+      if (selected.length === 0) {
+        return;
+      }
+      if (!confirm('Delete selected history notes?')) {
+        return;
+      }
+      var form = document.createElement('form');
+      form.method = 'post';
+      form.action = '/history/delete';
+      selected.forEach(function(box) {
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'delete_response';
+        input.value = box.value;
+        form.appendChild(input);
+      });
+      document.body.appendChild(form);
+      form.submit();
+    }
+    function compileHistoryRequest(mode, start, end) {
+      var params = new URLSearchParams();
+      params.set('mode', mode);
+      var includeInstructions = document.getElementById('history-include-instructions');
+      params.set('include_instructions', includeInstructions && includeInstructions.checked ? 'true' : 'false');
+      if (mode === 'range') {
+        params.set('range_start', start);
+        params.set('range_end', end);
+      }
+      fetch('/history/compile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+        },
+        body: params.toString()
+      }).then(function(response) {
+        return response.json();
+      }).then(function(payload) {
+        if (payload.error) {
+          alert(payload.error);
+          return;
+        }
+        var text = payload.compiled || '';
+        function fallbackCopy() {
+          var area = document.createElement('textarea');
+          area.value = text;
+          document.body.appendChild(area);
+          area.focus();
+          area.select();
+          try {
+            document.execCommand('copy');
+          } catch (err) {
+          }
+          document.body.removeChild(area);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).catch(fallbackCopy).finally(function() {
+            window.location.href = '/history?compiled=1';
+          });
+        } else {
+          fallbackCopy();
+          window.location.href = '/history?compiled=1';
+        }
+      });
+    }
+    function compileAllHistory() {
+      compileHistoryRequest('all');
+    }
+    function compileHistoryRange() {
+      var startInput = document.getElementById('history-range-start');
+      var endInput = document.getElementById('history-range-end');
+      var startValue = startInput ? startInput.value.trim() : '';
+      var endValue = endInput ? endInput.value.trim() : '';
+      if (startValue === '' || endValue === '') {
+        alert('range start and end are required');
+        return;
+      }
+      compileHistoryRequest('range', startValue, endValue);
+    }
+    syncResponseSelectionState();
   </script>
   ` + liveReloadScript + `
 </body>
@@ -2744,7 +3448,7 @@ var promptsTemplate = template.Must(template.New("prompts").Parse(`<!doctype htm
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     ` + currentProjectBanner + `
     <section class="panel compact">
@@ -3151,7 +3855,7 @@ var projectsTemplate = template.Must(template.New("projects").Parse(`<!doctype h
   <main class="shell">
     <nav class="nav">
       ` + navBrand + `
-      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}>{{.Label}}</a>{{end}}</div>
+      <div class="nav-links">{{range .Nav}}<a href="{{.Href}}" {{if .Current}}class="current"{{end}}><span class="nav-link-label">{{.Label}}{{if gt .Badge 0}}<span class="nav-badge">{{.Badge}}</span>{{end}}</span></a>{{end}}</div>
     </nav>
     ` + currentProjectBanner + `
     {{if .Switched}}<section class="panel success">project switched</section>{{end}}
@@ -3188,18 +3892,11 @@ var projectsTemplate = template.Must(template.New("projects").Parse(`<!doctype h
       </div>
       <div class="project-list">
         {{range .Projects}}
-        <section class="panel project-card {{if .Current}}success{{end}}">
+        <section class="panel project-card clickable-card {{if .Current}}success{{end}}" tabindex="0" role="button" aria-label="{{if .Current}}Open current project {{.Name}}{{else}}Switch to project {{.Name}}{{end}}" onclick="window.location.href='{{if .Current}}/new{{else}}/projects/switch?path={{urlquery .Path}}{{end}}'" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); this.click(); }">
           <div class="project-meta">
             <div class="project-name">{{.Name}}{{if .Current}} <span class="mark-badge">current</span>{{end}}</div>
             <div class="instructions project-path">{{.Path}}</div>
             {{if .LastOpened}}<div class="small">last opened {{.LastOpened}}</div>{{end}}
-          </div>
-          <div class="actions">
-            {{if .Current}}
-            <a class="button" href="/new">Open current project</a>
-            {{else}}
-            <a class="button primary" href="/projects/switch?path={{urlquery .Path}}">Switch to project</a>
-            {{end}}
           </div>
         </section>
         {{else}}

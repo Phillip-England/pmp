@@ -49,6 +49,14 @@ func builtInThemePresets() []ThemePreset {
 		{Name: "Rose", AccentColor: "#e889b5", SecondaryAccentColor: "#ffd27a"},
 		{Name: "Slate", AccentColor: "#9fb3c8", SecondaryAccentColor: "#e7c98f"},
 		{Name: "Ice", AccentColor: "#9ae6d6", SecondaryAccentColor: "#f7d794"},
+		{Name: "Lagoon", AccentColor: "#4fd1c5", SecondaryAccentColor: "#f6ad55"},
+		{Name: "Copper", AccentColor: "#dd8b5b", SecondaryAccentColor: "#f6d365"},
+		{Name: "Aurora", AccentColor: "#7dd3fc", SecondaryAccentColor: "#f9a8d4"},
+		{Name: "Citrus", AccentColor: "#a3e635", SecondaryAccentColor: "#fb7185"},
+		{Name: "Denim", AccentColor: "#60a5fa", SecondaryAccentColor: "#fbbf24"},
+		{Name: "Mint", AccentColor: "#6ee7b7", SecondaryAccentColor: "#fcd34d"},
+		{Name: "Ruby", AccentColor: "#f87171", SecondaryAccentColor: "#fdba74"},
+		{Name: "Orchid", AccentColor: "#c084fc", SecondaryAccentColor: "#f9a8d4"},
 	}
 }
 

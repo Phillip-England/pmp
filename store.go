@@ -95,18 +95,25 @@ func loadPrompts() ([]Prompt, error) {
 	return loadMarkdownRecords(promptsDir)
 }
 
-func loadResponses() ([]Prompt, error) {
+func loadHistory() ([]Prompt, error) {
 	if err := ensureProject(); err != nil {
 		return nil, err
 	}
-	responsesDir, err := responsesPath()
+	if err := migrateLegacyResponsesToHistory(); err != nil {
+		return nil, err
+	}
+	historyDir, err := historyPath()
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(responsesDir, 0o755); err != nil {
+	if err := os.MkdirAll(historyDir, 0o755); err != nil {
 		return nil, err
 	}
-	return loadMarkdownRecords(responsesDir)
+	return loadMarkdownRecords(historyDir)
+}
+
+func loadResponses() ([]Prompt, error) {
+	return loadHistory()
 }
 
 func loadMarkdownRecords(dir string) ([]Prompt, error) {

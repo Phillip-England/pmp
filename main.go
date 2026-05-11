@@ -64,15 +64,16 @@ Usage:
   pmp new     Save a prompt from the CLI with a title and body
   pmp add     Add a prompt, skill, or memory from the CLI
   pmp serve   Serve the browser UI for browsing and compiling prompts
-  pmp list    List prompts, responses, skills, or memories
-  pmp print   Print one prompt, response, skill, or memory
+  pmp list    List prompts, history, skills, or memories
+  pmp print   Print one prompt, history, skill, or memory
   pmp mark    Mark one prompt index for tracking
   pmp unmark  Remove prompt marks
   pmp delete  Delete prompts by index or inclusive range
-  pmp remove  Remove one prompt, response, skill, or memory
-  pmp compile Compile prompt history from the CLI
+  pmp remove  Remove one prompt, history, skill, or memory
+  pmp compile Compile prompt history or assistant history from the CLI
 
 Compile flags:
+  history
   --from-mark
   --range <start> <end>
   --stdout

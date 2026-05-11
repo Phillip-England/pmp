@@ -179,6 +179,13 @@ func dedupeStrings(values []string) []string {
 }
 
 func runCompileCommand(args []string) error {
+	if len(args) > 0 && strings.EqualFold(strings.TrimSpace(args[0]), "history") {
+		target, err := parseCompileArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		return runCompileHistory(target)
+	}
 	target, err := parseCompileArgs(args)
 	if err != nil {
 		return err
@@ -232,6 +239,49 @@ func runCompile(target compileTarget) error {
 	}
 }
 
+func runCompileHistory(target compileTarget) error {
+	if target.FromMark {
+		return errors.New("history compile does not support `--from-mark`")
+	}
+	if len(target.IncludedSkills) > 0 {
+		return errors.New("history compile does not support skill selection")
+	}
+
+	history, err := loadHistory()
+	if err != nil {
+		return err
+	}
+	projectInstructions, err := loadProjectInstructions()
+	if err != nil {
+		return err
+	}
+	memories, err := loadMemories()
+	if err != nil {
+		return err
+	}
+
+	selected, err := resolveCompileIndexesCLI(target, len(history))
+	if err != nil {
+		return err
+	}
+
+	compiled, err := compileHistoryIndexes(history, selected)
+	if err != nil {
+		return err
+	}
+	compiled = assembleHistoryCompiledDocument(projectInstructions, memories, compiled, target.IncludeInstructions)
+
+	switch {
+	case target.OutputFile != "":
+		return writeCompiledFile(target.OutputFile, compiled)
+	case target.ToStdout:
+		_, err := os.Stdout.WriteString(compiled)
+		return err
+	default:
+		return copyCompiledToClipboard(compiled)
+	}
+}
+
 func resolveCompileIndexesCLI(target compileTarget, promptCount int) ([]int, error) {
 	switch {
 	case target.FromMark:
@@ -257,6 +307,29 @@ func compilePrompts(prompts []Prompt, rng *compileRange, skills []Skill, include
 		return "", err
 	}
 	return compilePromptIndexes(prompts, indexes, skills, includedSkills)
+}
+
+func compileHistoryIndexes(entries []Prompt, indexes []int) (string, error) {
+	sorted := append([]int(nil), indexes...)
+	sort.Ints(sorted)
+
+	var historyBody strings.Builder
+	for _, i := range sorted {
+		if i < 0 || i >= len(entries) {
+			return "", fmt.Errorf("compile index %d is out of bounds; highest history index is %d", i, len(entries)-1)
+		}
+		entry := entries[i]
+		if historyBody.Len() > 0 {
+			historyBody.WriteString("\n\n")
+		}
+		historyBody.WriteString("<!-- history ")
+		historyBody.WriteString(strconv.Itoa(i))
+		historyBody.WriteString(" | ")
+		historyBody.WriteString(entry.Timestamp.Format(time.RFC3339))
+		historyBody.WriteString(" -->\n")
+		historyBody.WriteString(strings.TrimSpace(entry.Markdown))
+	}
+	return renderHistoryCompileDocument("", nil, historyBody.String()), nil
 }
 
 func compilePromptIndexes(prompts []Prompt, indexes []int, skills []Skill, includedSkills []string) (string, error) {
@@ -310,6 +383,17 @@ func assembleCompiledDocument(instructions string, memories []Memory, compiled s
 	return renderCompileDocument(instructions, memories, skills, prompts)
 }
 
+func assembleHistoryCompiledDocument(instructions string, memories []Memory, compiled string, includeInstructions bool) string {
+	history := extractCompileSection("History", compiled)
+	if history == "" {
+		history = compiled
+	}
+	if !includeInstructions {
+		instructions = ""
+	}
+	return renderHistoryCompileDocument(instructions, memories, history)
+}
+
 func prefixCompiledWithInstructions(instructions string, memories []Memory, compiled string) string {
 	return assembleCompiledDocument(instructions, memories, compiled, true)
 }
@@ -317,7 +401,7 @@ func prefixCompiledWithInstructions(instructions string, memories []Memory, comp
 func renderCompileDocument(instructions string, memories []Memory, skills string, prompts string) string {
 	var b strings.Builder
 	if strings.TrimSpace(instructions) != "" {
-		writeCompileSection(&b, "Instructions", "Read this section first. It explains how to use the compiled material and how to write response notes back into the project.", instructions, "_No instructions provided._")
+		writeCompileSection(&b, "Instructions", "Read this section first. It explains how to use the compiled material and how to write history notes back into the project.", instructions, "_No instructions provided._")
 		b.WriteString("\n\n")
 	}
 	b.WriteString("<!-- MEMORY SECTION -->\n")
@@ -336,6 +420,38 @@ func renderCompileDocument(instructions string, memories []Memory, skills string
 	writeCompileSection(&b, "Skills", "These are the optional selected skills included for this compilation.", skills, "_No skills selected._")
 	b.WriteString("\n\n")
 	writeCompileSection(&b, "Prompts", "These are the selected prompts in chronological order.", prompts, "_No prompts selected._")
+	b.WriteByte('\n')
+	return b.String()
+}
+
+func renderHistoryCompileDocument(instructions string, memories []Memory, history string) string {
+	var b strings.Builder
+	if strings.TrimSpace(instructions) != "" {
+		writeCompileSection(&b, "Instructions", "Read this section first. It explains how to use the compiled material and how to write history notes back into the project.", instructions, "_No instructions provided._")
+		b.WriteString("\n\n")
+	}
+	b.WriteString("<!-- MEMORY SECTION -->\n")
+	b.WriteString("# Memory Section\n")
+	b.WriteString("This section contains project-specific context that should be applied throughout the work.\n\n")
+	if len(memories) == 0 {
+		b.WriteString("_No memories recorded._")
+	} else {
+		for _, m := range memories {
+			b.WriteString(strings.TrimSpace(m.Body))
+			b.WriteString("\n\n")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n\n")
+	b.WriteString("<!-- HISTORY SECTION -->\n")
+	b.WriteString("# History Section\n")
+	b.WriteString("This section contains project history recorded by the assistant who previously made changes. Treat it as implementation history from the assistant's perspective.\n\n")
+	history = strings.TrimSpace(history)
+	if history == "" {
+		b.WriteString("_No history selected._")
+	} else {
+		b.WriteString(history)
+	}
 	b.WriteByte('\n')
 	return b.String()
 }
@@ -364,6 +480,7 @@ func extractCompileSection(title string, compiled string) string {
 		"<!-- MEMORY SECTION -->",
 		"<!-- SKILLS SECTION -->",
 		"<!-- PROMPTS SECTION -->",
+		"<!-- HISTORY SECTION -->",
 	}
 	start := strings.Index(compiled, startMarker)
 	if start == -1 {
@@ -394,7 +511,7 @@ func writeCompiledFile(path string, compiled string) error {
 	if err := os.WriteFile(path, []byte(compiled), 0o644); err != nil {
 		return err
 	}
-	fmt.Println("compiled prompts written to " + filepath.Clean(path))
+	fmt.Println("compiled document written to " + filepath.Clean(path))
 	return nil
 }
 
@@ -408,7 +525,7 @@ func copyCompiledToClipboard(compiled string) error {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("copy to clipboard with %s failed: %w (%s)", command, err, strings.TrimSpace(string(output)))
 	}
-	fmt.Println("compiled prompts copied to clipboard")
+	fmt.Println("compiled document copied to clipboard")
 	return nil
 }
 

@@ -18,13 +18,13 @@ var builtInSkills = []Skill{
 - Preserve chronological prompt order.
 - Keep memory before skills and prompts.
 - Prefer built-in instructions unless the compile explicitly excludes them.
-- Confirm the response note requirement still points at .pmp/responses/.`,
+- Confirm the history note requirement still points at .pmp/history/.`,
 	},
 	{
-		Name: "pmp-response-note",
-		Body: `# PMP Response Note
+		Name: "pmp-history-note",
+		Body: `# PMP History Note
 
-- Write a new timestamped markdown file in .pmp/responses/.
+- Write a new timestamped markdown file in .pmp/history/.
 - Use YAML frontmatter with title and timestamp in RFC3339 format.
 - Include a matching top-level heading.
 - Keep the note short and record the main result, risk, blocker, or follow-up.`,

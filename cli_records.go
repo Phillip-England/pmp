@@ -17,8 +17,8 @@ func runListCommand(args []string) error {
 		switch strings.ToLower(strings.TrimSpace(args[0])) {
 		case "prompt", "prompts":
 			return runList()
-		case "response", "responses":
-			return runListResponses()
+		case "history", "histories", "response", "responses":
+			return runListHistory()
 		case "skill", "skills":
 			return runListSkills()
 		case "memory", "memories":
@@ -27,7 +27,7 @@ func runListCommand(args []string) error {
 			return fmt.Errorf("unknown list target %q", args[0])
 		}
 	default:
-		return errors.New("usage: `pmp list [prompts|responses|skills|memories]`")
+		return errors.New("usage: `pmp list [prompts|history|skills|memories]`")
 	}
 }
 
@@ -50,14 +50,14 @@ func runAddCommand(args []string) error {
 
 func runRemoveCommand(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: `pmp remove prompt <index> [<end>]`, `pmp remove response <index>`, `pmp remove skill <name>`, or `pmp remove memory <name>`")
+		return errors.New("usage: `pmp remove prompt <index> [<end>]`, `pmp remove history <index>`, `pmp remove skill <name>`, or `pmp remove memory <name>`")
 	}
 
 	switch strings.ToLower(strings.TrimSpace(args[0])) {
 	case "prompt":
 		return runDeleteCommand(args[1:])
-	case "response":
-		return runRemoveResponse(args[1:])
+	case "history", "response":
+		return runRemoveHistory(args[1:])
 	case "skill":
 		return runRemoveSkill(args[1:])
 	case "memory":
@@ -69,14 +69,14 @@ func runRemoveCommand(args []string) error {
 
 func runPrintCommand(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: `pmp print prompt <index>`, `pmp print response <index>`, `pmp print skill <name>`, or `pmp print memory <name>`")
+		return errors.New("usage: `pmp print prompt <index>`, `pmp print history <index>`, `pmp print skill <name>`, or `pmp print memory <name>`")
 	}
 
 	switch strings.ToLower(strings.TrimSpace(args[0])) {
 	case "prompt":
 		return runPrintPrompt(args[1:])
-	case "response":
-		return runPrintResponse(args[1:])
+	case "history", "response":
+		return runPrintHistory(args[1:])
 	case "skill":
 		return runPrintSkill(args[1:])
 	case "memory":
@@ -101,18 +101,18 @@ func runListSkills() error {
 	return nil
 }
 
-func runListResponses() error {
-	responses, err := loadResponses()
+func runListHistory() error {
+	history, err := loadHistory()
 	if err != nil {
 		return err
 	}
-	if len(responses) == 0 {
-		fmt.Println("no responses yet")
+	if len(history) == 0 {
+		fmt.Println("no history yet")
 		return nil
 	}
-	for i := len(responses) - 1; i >= 0; i-- {
-		response := responses[i]
-		fmt.Printf("[%d] %s  %s\n", i, response.Timestamp.Local().Format("2006-01-02 15:04:05 MST"), response.Title)
+	for i := len(history) - 1; i >= 0; i-- {
+		entry := history[i]
+		fmt.Printf("[%d] %s  %s\n", i, entry.Timestamp.Local().Format("2006-01-02 15:04:05 MST"), entry.Title)
 	}
 	return nil
 }
@@ -207,18 +207,18 @@ func runRemoveSkill(args []string) error {
 	return nil
 }
 
-func runRemoveResponse(args []string) error {
+func runRemoveHistory(args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: `pmp remove response <index>`")
+		return errors.New("usage: `pmp remove history <index>`")
 	}
-	response, index, err := responseByIndexArg(args[0])
+	entry, index, err := historyByIndexArg(args[0])
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(response.Path); err != nil {
+	if err := os.Remove(entry.Path); err != nil {
 		return err
 	}
-	fmt.Printf("removed response %d\n", index)
+	fmt.Printf("removed history %d\n", index)
 	return nil
 }
 
@@ -261,16 +261,28 @@ func runPrintSkill(args []string) error {
 	return err
 }
 
-func runPrintResponse(args []string) error {
+func runPrintHistory(args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: `pmp print response <index>`")
+		return errors.New("usage: `pmp print history <index>`")
 	}
-	response, _, err := responseByIndexArg(args[0])
+	entry, _, err := historyByIndexArg(args[0])
 	if err != nil {
 		return err
 	}
-	_, err = os.Stdout.WriteString(strings.TrimRight(response.Markdown, "\n") + "\n")
+	_, err = os.Stdout.WriteString(strings.TrimRight(entry.Markdown, "\n") + "\n")
 	return err
+}
+
+func runListResponses() error {
+	return runListHistory()
+}
+
+func runRemoveResponse(args []string) error {
+	return runRemoveHistory(args)
+}
+
+func runPrintResponse(args []string) error {
+	return runPrintHistory(args)
 }
 
 func runPrintMemory(args []string) error {
@@ -303,19 +315,23 @@ func promptByIndexArg(raw string) (Prompt, int, error) {
 	return prompts[index], index, nil
 }
 
-func responseByIndexArg(raw string) (Prompt, int, error) {
-	responses, err := loadResponses()
+func historyByIndexArg(raw string) (Prompt, int, error) {
+	history, err := loadHistory()
 	if err != nil {
 		return Prompt{}, 0, err
 	}
 	index, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil {
-		return Prompt{}, 0, fmt.Errorf("invalid response index %q", raw)
+		return Prompt{}, 0, fmt.Errorf("invalid history index %q", raw)
 	}
-	if index < 0 || index >= len(responses) {
-		return Prompt{}, 0, fmt.Errorf("response index %d is out of bounds; highest response index is %d", index, len(responses)-1)
+	if index < 0 || index >= len(history) {
+		return Prompt{}, 0, fmt.Errorf("history index %d is out of bounds; highest history index is %d", index, len(history)-1)
 	}
-	return responses[index], index, nil
+	return history[index], index, nil
+}
+
+func responseByIndexArg(raw string) (Prompt, int, error) {
+	return historyByIndexArg(raw)
 }
 
 func findSkillByName(name string) (Skill, error) {
